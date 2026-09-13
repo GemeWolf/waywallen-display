@@ -6,6 +6,7 @@
 
 import Meta from 'gi://Meta';
 import GLib from 'gi://GLib';
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 import * as Wallpaper from './wallpaper.js';
 import {WindowExclusions} from './windowExclusions.js';
@@ -51,6 +52,7 @@ export class WindowStateMonitor {
         const wm = global.window_manager;
         const disp = global.display;
         const wsm = global.workspace_manager;
+        const overview = Main.overview;
         this._sigs.push([wm, wm.connect('size-change', queue)]);    // (un)maximize / fullscreen
         this._sigs.push([wm, wm.connect('minimize', queue)]);
         this._sigs.push([wm, wm.connect('unminimize', queue)]);
@@ -59,6 +61,8 @@ export class WindowStateMonitor {
         this._sigs.push([disp, disp.connect('notify::focus-window', queue)]);
         this._sigs.push([wsm, wsm.connect('active-workspace-changed', queue)]);
         this._sigs.push([wsm, wsm.connect('showing-desktop-changed', queue)]);
+        this._sigs.push([overview, overview.connect('showing', queue)]);
+        this._sigs.push([overview, overview.connect('hidden', queue)]);
         this._queue();
     }
 
@@ -126,8 +130,10 @@ export class WindowStateMonitor {
                     .map(signal => w.connect(signal, () => this._queue()));
                 this._windowSignals.set(w, signals);
             }
+            // Overview exposes the wallpaper until its exit animation finishes.
+            // Keep observing window metadata while suppressing coverage.
             // Show-desktop hides normal windows without minimizing them.
-            if (w.skip_taskbar || !w.showing_on_its_workspace())
+            if (Main.overview.visible || w.skip_taskbar || !w.showing_on_its_workspace())
                 continue;
             if (w.title?.includes(APPLICATION_ID))
                 continue;
