@@ -857,9 +857,10 @@ bool WaywallenDisplay::eventFilter(QObject* obj, QEvent* ev) {
         auto* me = static_cast<QMouseEvent*>(ev);
         float px, py;
         if (! toSurface(me->scenePosition(), px, py)) return false;
-        const uint64_t ts = uint64_t(me->timestamp()) * 1000ull;
+        // Toolkit timestamps may wrap or use a process-local epoch. Stamp the
+        // shared CLOCK_MONOTONIC time in the display library instead.
         (void)waywallen_display_send_pointer_motion(
-            display, px, py, ts, qtModifiers(me->modifiers()));
+            display, px, py, 0, qtModifiers(me->modifiers()));
         break;
     }
     case QEvent::MouseButtonPress:
@@ -869,12 +870,11 @@ bool WaywallenDisplay::eventFilter(QObject* obj, QEvent* ev) {
         if (! toSurface(me->scenePosition(), px, py)) return false;
         const uint32_t code = qtButtonToLinuxCode(me->button());
         if (code == 0) return false;
-        const uint64_t ts    = uint64_t(me->timestamp()) * 1000ull;
         const auto     state = (ev->type() == QEvent::MouseButtonPress)
                                    ? WAYWALLEN_POINTER_BUTTON_STATE_PRESSED
                                    : WAYWALLEN_POINTER_BUTTON_STATE_RELEASED;
         (void)waywallen_display_send_pointer_button(
-            display, px, py, code, state, ts, qtModifiers(me->modifiers()));
+            display, px, py, code, state, 0, qtModifiers(me->modifiers()));
         break;
     }
     case QEvent::Wheel: {
@@ -885,14 +885,13 @@ bool WaywallenDisplay::eventFilter(QObject* obj, QEvent* ev) {
         const float  dx    = float(angle.x()) / 120.0f;
         const float  dy    = float(angle.y()) / 120.0f;
         if (dx == 0.0f && dy == 0.0f) return false;
-        const uint64_t ts = uint64_t(we->timestamp()) * 1000ull;
         (void)waywallen_display_send_pointer_axis(display,
                                                   px,
                                                   py,
                                                   dx,
                                                   dy,
                                                   WAYWALLEN_POINTER_AXIS_SOURCE_WHEEL,
-                                                  ts,
+                                                  0,
                                                   qtModifiers(we->modifiers()));
         break;
     }

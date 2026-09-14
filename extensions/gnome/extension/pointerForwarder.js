@@ -5,6 +5,7 @@
 // are observed non-consuming: the desktop/apps still get them.
 
 import Clutter from 'gi://Clutter';
+import GLib from 'gi://GLib';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
 // Clutter button number → Linux input event code.
@@ -44,7 +45,7 @@ export class PointerForwarder {
         if (!this._launcher?.running || Main.overview.visible)
             return PROPAGATE;
 
-        const ts = event.get_time() * 1000;  // ms → µs
+        const ts = GLib.get_monotonic_time();
         let line = null;
         switch (event.type()) {
         case Clutter.EventType.MOTION: {
