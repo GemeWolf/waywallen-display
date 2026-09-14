@@ -59,6 +59,12 @@ export class WindowStateMonitor {
         this._sigs.push([wm, wm.connect_after('map', queue)]);
         this._sigs.push([wm, wm.connect('destroy', queue)]);
         this._sigs.push([disp, disp.connect('notify::focus-window', queue)]);
+        this._sigs.push([disp, disp.connect('window-entered-monitor', queue)]);
+        this._sigs.push([disp, disp.connect('window-left-monitor', queue)]);
+        this._sigs.push([Main.layoutManager, Main.layoutManager.connect('monitors-changed', () => {
+            this._lastFlags.clear();
+            this._queue();
+        })]);
         this._sigs.push([wsm, wsm.connect('active-workspace-changed', queue)]);
         this._sigs.push([wsm, wsm.connect('showing-desktop-changed', queue)]);
         this._sigs.push([overview, overview.connect('showing', queue)]);
