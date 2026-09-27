@@ -147,6 +147,10 @@ typedef struct waywallen_display_metrics {
     uint32_t refresh_mhz;
 } waywallen_display_metrics_t;
 
+typedef struct waywallen_pause_effect_capabilities {
+    uint32_t flags;
+} waywallen_pause_effect_capabilities_t;
+
 typedef struct waywallen_pause_effect_config {
     waywallen_pause_effect_kind_t kind;
     waywallen_blur_effect_config_t blur;
@@ -184,6 +188,24 @@ typedef struct waywallen_presentation_snapshot {
     waywallen_presentation_config_t config;
     waywallen_presentation_state_t state;
 } waywallen_presentation_snapshot_t;
+
+typedef struct waywallen_transition_capabilities {
+    uint32_t flags;
+} waywallen_transition_capabilities_t;
+
+typedef struct waywallen_window_observation_capabilities {
+    uint32_t flags;
+} waywallen_window_observation_capabilities_t;
+
+typedef struct waywallen_window_observation_config {
+    uint64_t generation;
+    ww_array_string_t excluded_application_ids;
+    ww_array_string_t excluded_titles;
+    bool has_excluded_application_id_patterns;
+    ww_array_string_t excluded_application_id_patterns;
+    bool has_excluded_title_patterns;
+    ww_array_string_t excluded_title_patterns;
+} waywallen_window_observation_config_t;
 
 #endif /* WAYWALLEN_PROTOCOL_NAMED_TYPES_DEFINED */
 

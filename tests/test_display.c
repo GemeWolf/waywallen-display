@@ -54,16 +54,20 @@ struct test_state {
     char sock_path[128];
     int  listen_fd;
 
-    int on_disconnected_count;
-    int callback_sequence;
-    int last_presentation_snapshot_sequence;
-    int last_disconnected_sequence;
-    int on_binding_ready_count;
-    int on_textures_releasing_count;
-    int on_composition_config_count;
-    int on_frame_ready_count;
-    int on_presentation_snapshot_count;
-    int on_presentation_state_count;
+    int                  on_disconnected_count;
+    int                  callback_sequence;
+    int                  last_presentation_snapshot_sequence;
+    int                  last_disconnected_sequence;
+    int                  on_binding_ready_count;
+    int                  on_textures_releasing_count;
+    int                  on_composition_config_count;
+    int                  on_frame_ready_count;
+    int                  on_presentation_snapshot_count;
+    int                  on_presentation_state_count;
+    bool                 expect_observation;
+    bool                 observation_patterns;
+    int                  observation_callbacks;
+    waywallen_display_t* observation_client;
 
     int  last_disconnect_code;
     char last_disconnect_msg[256];
@@ -97,6 +101,10 @@ struct test_state {
     uint32_t                    consumer_caps_sync_caps;
     uint32_t                    consumer_caps_color_caps;
     uint32_t                    presentation_caps;
+    bool                        has_pause_effect_caps;
+    bool                        has_transition_caps;
+    uint32_t                    pause_effect_caps;
+    uint32_t                    transition_caps;
     waywallen_display_metrics_t registered_metrics;
     uint32_t                    registered_window_state;
 };
@@ -408,6 +416,21 @@ static int complete_handshake_capture_caps(int client_fd, struct test_state* ts)
     /* REGISTER_DISPLAY -> DISPLAY_ACCEPTED */
     rc = ww_codec_recv_request(
         client_fd, &op, body_buf, WW_CODEC_MAX_BODY_BYTES, &body_len, fds, 4, &n_fds);
+    if (rc == 0 && op == WW_REQ_CLIENT_CAPABILITIES) {
+        if (n_fds != 0) return -1;
+        ww_req_client_capabilities_t caps;
+        if (ww_req_client_capabilities_decode(body_buf, body_len, &caps) != WW_OK) return -1;
+        assert(caps.has_window_observation == ts->expect_observation);
+        if (ts->expect_observation)
+            assert(caps.window_observation.flags == (ts->observation_patterns ? 15u : 3u));
+        ts->has_pause_effect_caps = caps.has_pause_effect;
+        ts->has_transition_caps   = caps.has_transition;
+        ts->pause_effect_caps     = caps.pause_effect.flags;
+        ts->transition_caps       = caps.transition.flags;
+        ww_req_client_capabilities_free(&caps);
+        rc = ww_codec_recv_request(
+            client_fd, &op, body_buf, WW_CODEC_MAX_BODY_BYTES, &body_len, fds, 4, &n_fds);
+    }
     if (rc != 0 || op != WW_REQ_REGISTER_DISPLAY) return -1;
     ww_req_register_display_t reg;
     if (ww_req_register_display_decode(body_buf, body_len, &reg) != WW_OK) return -1;
@@ -429,6 +452,107 @@ static int complete_handshake_capture_caps(int client_fd, struct test_state* ts)
 
 static int handler_full_handshake_capture_caps(int client_fd, struct test_state* ts) {
     return complete_handshake_capture_caps(client_fd, ts);
+}
+
+static int handler_window_observation(int client_fd, struct test_state* ts) {
+    if (complete_handshake_capture_caps(client_fd, ts) != 0) return -1;
+    for (uint64_t generation = 1; generation <= 2; ++generation) {
+        char*                                  ids[] = { (char*)"cat" };
+        ww_evt_set_window_observation_config_t event = { 0 };
+        event.config.generation                      = generation;
+        event.config.excluded_application_ids =
+            (ww_array_string_t) { generation == 1 ? 1 : 0, ids };
+        char* patterns[] = { (char*)"cat*" };
+        if (ts->observation_patterns && generation == 1) {
+            event.config.has_excluded_application_id_patterns = true;
+            event.config.has_excluded_title_patterns          = true;
+            event.config.excluded_application_id_patterns     = (ww_array_string_t) { 1, patterns };
+            event.config.excluded_title_patterns              = (ww_array_string_t) { 1, patterns };
+        }
+        ww_buf_t buf;
+        ww_buf_init(&buf);
+        assert(ww_evt_set_window_observation_config_encode(&event, &buf) == WW_OK);
+        assert(ww_codec_send_event(
+                   client_fd, WW_EVT_SET_WINDOW_OBSERVATION_CONFIG, buf.data, buf.len, NULL, 0) ==
+               0);
+        ww_buf_free(&buf);
+        uint8_t  body[256];
+        uint16_t op;
+        size_t   len, n_fds;
+        int      fds[1];
+        assert(ww_codec_recv_request(client_fd, &op, body, sizeof(body), &len, fds, 1, &n_fds) ==
+               0);
+        assert(op == WW_REQ_SET_WINDOW_OBSERVATION_STATE && n_fds == 0);
+        ww_req_set_window_observation_state_t state;
+        assert(ww_req_set_window_observation_state_decode(body, len, &state) == WW_OK);
+        assert(state.config_generation == generation && state.flags == 1);
+    }
+    return 0;
+}
+
+static void cb_window_observation(void* data, const waywallen_window_observation_config_t* config) {
+    struct test_state* ts = data;
+    assert(++ts->observation_callbacks == (int)config->generation);
+    if (ts->observation_patterns && config->generation == 1) {
+        assert(config->has_excluded_application_id_patterns);
+        assert(config->has_excluded_title_patterns);
+        assert(config->excluded_application_id_patterns.count == 1);
+        assert(config->excluded_title_patterns.count == 1);
+        assert(strcmp(config->excluded_application_id_patterns.data[0], "cat*") == 0);
+        assert(strcmp(config->excluded_title_patterns.data[0], "cat*") == 0);
+    } else {
+        assert(! config->has_excluded_application_id_patterns);
+        assert(! config->has_excluded_title_patterns);
+        assert(config->excluded_application_id_patterns.count == 0);
+        assert(config->excluded_title_patterns.count == 0);
+    }
+    if (config->generation == 1) {
+        assert(config->excluded_application_ids.count == 1);
+        assert(strcmp(config->excluded_application_ids.data[0], "cat") == 0);
+    } else
+        assert(config->excluded_application_ids.count == 0);
+    assert(waywallen_display_get_window_observation_config(ts->observation_client) == config);
+    assert(waywallen_display_set_window_state(ts->observation_client, 1) == WAYWALLEN_ERR_STATE);
+    assert(waywallen_display_set_window_observation_state(
+               ts->observation_client, config->generation + 1, 1) == WAYWALLEN_ERR_STATE);
+    assert(waywallen_display_set_window_observation_state(
+               ts->observation_client, config->generation, 1) == WAYWALLEN_OK);
+}
+
+static void test_window_observation(bool patterns) {
+    struct test_state ts;
+    ts_init(&ts);
+    ts.expect_observation    = true;
+    ts.observation_patterns  = patterns;
+    pthread_t            srv = spawn_server(&ts, handler_window_observation);
+    waywallen_display_t* d   = make_client(&ts);
+    ts.observation_client    = d;
+    assert(waywallen_display_set_window_observation_callback(d, 4, cb_window_observation, &ts) ==
+           WAYWALLEN_ERR_INVAL);
+    assert(waywallen_display_set_window_observation_callback(
+               d, patterns ? 15 : 3, cb_window_observation, &ts) == WAYWALLEN_OK);
+    if (patterns) {
+        assert(waywallen_display_set_pause_effect_caps(d, WAYWALLEN_PAUSE_EFFECT_CAP_BLUR) ==
+               WAYWALLEN_OK);
+        assert(waywallen_display_set_transition_caps(d, WAYWALLEN_TRANSITION_CAP_GROW) ==
+               WAYWALLEN_OK);
+    }
+    assert(begin_test_display(d, ts.sock_path, 640, 480) == WAYWALLEN_OK);
+    assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
+    assert(ts.has_pause_effect_caps == patterns);
+    assert(ts.has_transition_caps == patterns);
+    if (patterns) {
+        assert(ts.pause_effect_caps == WAYWALLEN_PAUSE_EFFECT_CAP_BLUR);
+        assert(ts.transition_caps == WAYWALLEN_TRANSITION_CAP_GROW);
+    }
+    assert(dispatch_next_event(d) == WAYWALLEN_OK);
+    assert(dispatch_next_event(d) == WAYWALLEN_OK);
+    assert(ts.observation_callbacks == 2);
+    pthread_join(srv, NULL);
+    waywallen_display_close(d);
+    assert(waywallen_display_get_window_observation_config(d) == NULL);
+    waywallen_display_free(d);
+    ts_teardown(&ts);
 }
 
 static int handler_frame_release_armed(int client_fd, struct test_state* ts) {
@@ -1103,6 +1227,8 @@ static void test_presentation_snapshot_updates_and_disconnect_reset(void) {
     pthread_t srv = spawn_server(&ts, handler_presentation_updates);
 
     waywallen_display_t* d = make_client(&ts);
+    assert(waywallen_display_set_pause_effect_caps(d, WAYWALLEN_PAUSE_EFFECT_CAP_BLUR) ==
+           WAYWALLEN_OK);
     assert(begin_test_display(d, ts.sock_path, 1920, 1080) == WAYWALLEN_OK);
     assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
     assert(ts.on_presentation_snapshot_count == 1);
@@ -1132,6 +1258,55 @@ static void test_presentation_snapshot_updates_and_disconnect_reset(void) {
     waywallen_display_free(d);
     ts_teardown(&ts);
     printf("  ok test_presentation_snapshot_updates_and_disconnect_reset\n");
+}
+
+static void test_independent_presentation_capabilities(void) {
+    const int cases[][2] = { { -1, -1 }, { 0, -1 }, { -1, 0 }, { 1, 7 }, { 0, 0 } };
+    assert(waywallen_display_set_pause_effect_caps(NULL, 0) == WAYWALLEN_ERR_INVAL);
+    assert(waywallen_display_set_transition_caps(NULL, 0) == WAYWALLEN_ERR_INVAL);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        struct test_state ts;
+        ts_init(&ts);
+        pthread_t            srv = spawn_server(&ts, handler_full_handshake_capture_caps);
+        waywallen_display_t* d   = make_client(&ts);
+        assert(waywallen_display_set_presentation_caps(d, 15) == WAYWALLEN_OK);
+        assert(waywallen_display_set_pause_effect_caps(d, 2) == WAYWALLEN_ERR_INVAL);
+        assert(waywallen_display_set_transition_caps(d, 8) == WAYWALLEN_ERR_INVAL);
+        if (cases[i][0] >= 0)
+            assert(waywallen_display_set_pause_effect_caps(d, (uint32_t)cases[i][0]) ==
+                   WAYWALLEN_OK);
+        if (cases[i][1] >= 0)
+            assert(waywallen_display_set_transition_caps(d, (uint32_t)cases[i][1]) == WAYWALLEN_OK);
+        assert(begin_test_display(d, ts.sock_path, 640, 480) == WAYWALLEN_OK);
+        assert(waywallen_display_set_pause_effect_caps(d, 0) == WAYWALLEN_ERR_STATE);
+        assert(waywallen_display_set_transition_caps(d, 0) == WAYWALLEN_ERR_STATE);
+        assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
+        assert(ts.has_pause_effect_caps == (cases[i][0] >= 0));
+        assert(ts.has_transition_caps == (cases[i][1] >= 0));
+        assert(ts.pause_effect_caps == (cases[i][0] >= 0 ? (uint32_t)cases[i][0] : 0));
+        assert(ts.transition_caps == (cases[i][1] >= 0 ? (uint32_t)cases[i][1] : 0));
+        assert(ts.presentation_caps ==
+               ((cases[i][0] < 0 ? 1u : 0u) | (cases[i][1] < 0 ? 14u : 0u)));
+        waywallen_display_close(d);
+        waywallen_display_free(d);
+        pthread_join(srv, NULL);
+        ts_teardown(&ts);
+    }
+}
+
+static void test_undeclared_pause_effect_is_protocol_error(void) {
+    struct test_state ts;
+    ts_init(&ts);
+    pthread_t            srv = spawn_server(&ts, handler_presentation_updates);
+    waywallen_display_t* d   = make_client(&ts);
+    assert(waywallen_display_set_pause_effect_caps(d, 0) == WAYWALLEN_OK);
+    assert(begin_test_display(d, ts.sock_path, 640, 480) == WAYWALLEN_OK);
+    assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
+    assert(dispatch_next_event(d) == WAYWALLEN_ERR_PROTO);
+    assert(strcmp(ts.last_disconnect_msg, "invalid presentation snapshot") == 0);
+    waywallen_display_free(d);
+    pthread_join(srv, NULL);
+    ts_teardown(&ts);
 }
 
 static void test_cross_generation_state_is_protocol_error(void) {
@@ -1197,11 +1372,11 @@ static void test_content_binding_reaches_host(void) {
     pthread_t srv = spawn_server(&ts, handler_transition_bind);
 
     waywallen_display_t* d = make_client(&ts);
-    assert(waywallen_display_set_presentation_caps(d, WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION) ==
-           WAYWALLEN_OK);
+    assert(waywallen_display_set_transition_caps(d, WAYWALLEN_TRANSITION_CAP_FADE) == WAYWALLEN_OK);
     assert(begin_test_display(d, ts.sock_path, 1920, 1080) == WAYWALLEN_OK);
     assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
-    assert(ts.presentation_caps == WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION);
+    assert(ts.presentation_caps == 0);
+    assert(ts.has_transition_caps && ts.transition_caps == WAYWALLEN_TRANSITION_CAP_FADE);
     assert(dispatch_next_event(d) == WAYWALLEN_OK); /* snapshot with fade */
     assert(ts.last_presentation.config.transition.kind == WAYWALLEN_TRANSITION_KIND_FADE);
     assert(ts.last_presentation.config.transition.duration_ms == 500);
@@ -1729,6 +1904,10 @@ static void test_frame_release_armed_round_trip(void) {
 /* ------------------------------------------------------------------ */
 
 int main(void) {
+    test_independent_presentation_capabilities();
+    test_undeclared_pause_effect_is_protocol_error();
+    test_window_observation(false);
+    test_window_observation(true);
     test_connect_to_nonexistent_socket();
     test_legacy_blocking_connect();
     test_begin_connect_immediate();

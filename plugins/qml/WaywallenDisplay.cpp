@@ -905,6 +905,17 @@ bool WaywallenDisplay::eventFilter(QObject* obj, QEvent* ev) {
 void WaywallenDisplay::setConnState(ConnState s) {
     if (m_connState == s) return;
     m_connState = s;
+    if (s != Connected &&
+        (m_windowObservationGeneration != 0 || ! m_excludedApplicationIds.isEmpty() ||
+         ! m_excludedWindowTitles.isEmpty() || ! m_excludedApplicationPatterns.isEmpty() ||
+         ! m_excludedTitlePatterns.isEmpty())) {
+        m_windowObservationGeneration = 0;
+        m_excludedApplicationIds.clear();
+        m_excludedWindowTitles.clear();
+        m_excludedApplicationPatterns.clear();
+        m_excludedTitlePatterns.clear();
+        emit windowObservationChanged();
+    }
     emit connStateChanged();
     if (s == Connected) {
         m_reconnectTimer.stop();
@@ -930,7 +941,11 @@ void WaywallenDisplay::setWindowStateFlags(quint32 flags) {
     const bool changed = m_windowStateFlags != flags;
     m_windowStateFlags = flags;
     if (displayHandle()) {
-        if (waywallen_display_set_window_state(displayHandle(), flags) == WAYWALLEN_OK) {
+        const auto* config = waywallen_display_get_window_observation_config(displayHandle());
+        const int   rc     = config ? waywallen_display_set_window_observation_state(
+                                          displayHandle(), config->generation, flags)
+                                    : waywallen_display_set_window_state(displayHandle(), flags);
+        if (rc == WAYWALLEN_OK) {
             m_windowStateFlagsDirty = false;
             armWriteNotifier();
         } else {
@@ -945,12 +960,65 @@ void WaywallenDisplay::setWindowStateFlags(quint32 flags) {
     if (changed) emit windowStateFlagsChanged();
 }
 
+bool WaywallenDisplay::excludesWindow(const QString& applicationId, const QString& title) const {
+    const auto matches =
+        [](const QString& value, const QStringList& exact, const QVector<WindowPattern>& patterns) {
+            if (value.isEmpty()) return false;
+            if (exact.contains(value)) return true;
+            for (const auto& pattern : patterns)
+                if (pattern.matches(value)) return true;
+            return false;
+        };
+    return matches(applicationId, m_excludedApplicationIds, m_excludedApplicationPatterns) ||
+           matches(title, m_excludedWindowTitles, m_excludedTitlePatterns);
+}
+
 void WaywallenDisplay::setPresentationCapabilities(quint32 capabilities) {
-    if (m_presentationCapabilities == capabilities) return;
+    if (capabilities & ~15u) {
+        qCWarning(lcWD, "invalid legacy presentation capabilities");
+        return;
+    }
+    const auto pauseEffect       = capabilities & 1u;
+    const auto transition        = (capabilities >> 1) & 7u;
+    const bool pauseChanged      = m_pauseEffectCapabilities != pauseEffect;
+    const bool transitionChanged = m_transitionCapabilities != transition;
+    if (! pauseChanged && ! transitionChanged) return;
     if (displayHandle()) {
         qCWarning(lcWD, "presentation capabilities apply on the next connection");
     }
-    m_presentationCapabilities = capabilities;
+    m_pauseEffectCapabilities = pauseEffect;
+    m_transitionCapabilities  = transition;
+    if (pauseChanged) emit pauseEffectCapabilitiesChanged();
+    if (transitionChanged) emit transitionCapabilitiesChanged();
+    emit presentationCapabilitiesChanged();
+}
+
+void WaywallenDisplay::setPauseEffectCapabilities(quint32 capabilities) {
+    if (capabilities & ~WAYWALLEN_PAUSE_EFFECT_CAP_BLUR) {
+        qCWarning(lcWD, "invalid pause effect capabilities");
+        return;
+    }
+    if (m_pauseEffectCapabilities == capabilities) return;
+    if (displayHandle()) {
+        qCWarning(lcWD, "pause effect capabilities apply on the next connection");
+    }
+    m_pauseEffectCapabilities = capabilities;
+    emit pauseEffectCapabilitiesChanged();
+    emit presentationCapabilitiesChanged();
+}
+
+void WaywallenDisplay::setTransitionCapabilities(quint32 capabilities) {
+    if (capabilities & ~(WAYWALLEN_TRANSITION_CAP_FADE | WAYWALLEN_TRANSITION_CAP_WIPE |
+                         WAYWALLEN_TRANSITION_CAP_GROW)) {
+        qCWarning(lcWD, "invalid transition capabilities");
+        return;
+    }
+    if (m_transitionCapabilities == capabilities) return;
+    if (displayHandle()) {
+        qCWarning(lcWD, "transition capabilities apply on the next connection");
+    }
+    m_transitionCapabilities = capabilities;
+    emit transitionCapabilitiesChanged();
     emit presentationCapabilitiesChanged();
 }
 
@@ -1200,13 +1268,16 @@ void WaywallenDisplay::onWindowReady() {
             this,
             &WaywallenDisplay::onAfterFrameEnd,
             Qt::UniqueConnection);
-    #if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
-        connect(window(),
-            &QQuickWindow::devicePixelRatioChanged,
-            this,
-            [this]() { emit effectiveDevicePixelRatioChanged(); },
-            Qt::UniqueConnection);
-    #endif
+#if QT_VERSION >= QT_VERSION_CHECK(6, 11, 0)
+    connect(
+        window(),
+        &QQuickWindow::devicePixelRatioChanged,
+        this,
+        [this]() {
+            emit effectiveDevicePixelRatioChanged();
+        },
+        Qt::UniqueConnection);
+#endif
     onScreenChanged(window()->screen());
 
     if (m_mouseForwardEnabled) {
@@ -1314,7 +1385,9 @@ void WaywallenDisplay::onScreenChanged(QScreen* screen) {
     emit effectiveDevicePixelRatioChanged();
     // refresh on next event loop cycle as well, after qt updates dpr
     // Qt 6.11+ has a dedicated signal for older versions we use a singleShot.
-    QTimer::singleShot(0, this, [this]() { emit effectiveDevicePixelRatioChanged(); });
+    QTimer::singleShot(0, this, [this]() {
+        emit effectiveDevicePixelRatioChanged();
+    });
     if (screen) {
         connect(screen,
                 &QScreen::refreshRateChanged,
@@ -1353,9 +1426,38 @@ void WaywallenDisplay::tryConnect() {
         m_renderResources = resources;
     }
     auto* display = resources->display;
+    if (m_windowObservationCapabilities != 0) {
+        waywallen_display_set_window_observation_callback(
+            display,
+            m_windowObservationCapabilities,
+            [](void* data, const waywallen_window_observation_config_t* config) {
+                auto* self                          = static_cast<WaywallenDisplay*>(data);
+                self->m_windowObservationGeneration = config->generation;
+                self->m_excludedApplicationIds.clear();
+                self->m_excludedWindowTitles.clear();
+                self->m_excludedApplicationPatterns.clear();
+                self->m_excludedTitlePatterns.clear();
+                for (uint32_t i = 0; i < config->excluded_application_ids.count; ++i)
+                    self->m_excludedApplicationIds.append(
+                        QString::fromUtf8(config->excluded_application_ids.data[i]));
+                for (uint32_t i = 0; i < config->excluded_titles.count; ++i)
+                    self->m_excludedWindowTitles.append(
+                        QString::fromUtf8(config->excluded_titles.data[i]));
+                for (uint32_t i = 0; i < config->excluded_application_id_patterns.count; ++i)
+                    self->m_excludedApplicationPatterns.append(WindowPattern(
+                        QString::fromUtf8(config->excluded_application_id_patterns.data[i])));
+                for (uint32_t i = 0; i < config->excluded_title_patterns.count; ++i)
+                    self->m_excludedTitlePatterns.append(
+                        WindowPattern(QString::fromUtf8(config->excluded_title_patterns.data[i])));
+                emit self->windowObservationChanged();
+                self->setWindowStateFlags(self->m_windowStateFlags);
+            },
+            this);
+    }
 
-    if (waywallen_display_set_presentation_caps(display, m_presentationCapabilities) !=
-        WAYWALLEN_OK) {
+    if (waywallen_display_set_pause_effect_caps(display, m_pauseEffectCapabilities) !=
+            WAYWALLEN_OK ||
+        waywallen_display_set_transition_caps(display, m_transitionCapabilities) != WAYWALLEN_OK) {
         qCWarning(lcWD, "failed to set presentation capabilities");
         waywallen_display_free(display);
         resources->display = nullptr;

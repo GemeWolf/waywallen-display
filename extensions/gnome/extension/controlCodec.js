@@ -3,6 +3,7 @@ const FRAME_TYPES = new Set([
     'presentation-snapshot',
     'presentation-state',
     'reset',
+    'window-observation-config',
 ]);
 
 export const PauseEffectKind = Object.freeze({
@@ -47,6 +48,20 @@ export function validateControlFrame(frame) {
         throw new Error('unknown control frame');
     validateGeometry(frame.geometry);
     switch (frame.type) {
+    case 'window-observation-config': {
+        const config = frame.config;
+        const validList = values => Array.isArray(values) && values.length <= 64 &&
+            values.every(value => typeof value === 'string' && !value.includes('\0') &&
+                new TextEncoder().encode(value).length <= 256);
+        if (!config || !validGeneration(config.generation, true) ||
+            !validList(config.applicationIds) || !validList(config.titles) ||
+            !validList(config.applicationIdPatterns === undefined ? [] : config.applicationIdPatterns) ||
+            !validList(config.titlePatterns === undefined ? [] : config.titlePatterns) ||
+            config.applicationIds.length + (config.applicationIdPatterns?.length ?? 0) > 64 ||
+            config.titles.length + (config.titlePatterns?.length ?? 0) > 64)
+            throw new Error('invalid window observation config');
+        break;
+    }
     case 'connection':
     case 'presentation-snapshot':
         validateSnapshot(frame.presentation);

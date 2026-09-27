@@ -61,6 +61,7 @@ set(_ext_files
     extension/windowManager.js
     extension/pointerForwarder.js
     extension/windowState.js
+    extension/windowExclusions.js
     extension/prefs.js
 )
 

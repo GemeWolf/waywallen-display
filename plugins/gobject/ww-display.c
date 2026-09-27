@@ -44,10 +44,43 @@ enum
     SIGNAL_PRESENTATION_SNAPSHOT,
     SIGNAL_PRESENTATION_STATE,
     SIGNAL_DISCONNECTED,
+    SIGNAL_WINDOW_OBSERVATION_CONFIG,
+    SIGNAL_WINDOW_OBSERVATION_RULES,
     LAST_SIGNAL
 };
 
 static guint signals[LAST_SIGNAL] = { 0 };
+
+static void on_window_observation_config(void*                                        data,
+                                         const waywallen_window_observation_config_t* config) {
+    WwDisplay* self           = WW_DISPLAY(data);
+    gchar**    ids            = g_new0(gchar*, config->excluded_application_ids.count + 1);
+    gchar**    titles         = g_new0(gchar*, config->excluded_titles.count + 1);
+    gchar**    id_patterns    = g_new0(gchar*, config->excluded_application_id_patterns.count + 1);
+    gchar**    title_patterns = g_new0(gchar*, config->excluded_title_patterns.count + 1);
+    for (guint i = 0; i < config->excluded_application_ids.count; ++i)
+        ids[i] = config->excluded_application_ids.data[i];
+    for (guint i = 0; i < config->excluded_titles.count; ++i)
+        titles[i] = config->excluded_titles.data[i];
+    for (guint i = 0; i < config->excluded_application_id_patterns.count; ++i)
+        id_patterns[i] = config->excluded_application_id_patterns.data[i];
+    for (guint i = 0; i < config->excluded_title_patterns.count; ++i)
+        title_patterns[i] = config->excluded_title_patterns.data[i];
+    g_signal_emit(self,
+                  signals[SIGNAL_WINDOW_OBSERVATION_RULES],
+                  0,
+                  config->generation,
+                  ids,
+                  titles,
+                  id_patterns,
+                  title_patterns);
+    g_signal_emit(
+        self, signals[SIGNAL_WINDOW_OBSERVATION_CONFIG], 0, config->generation, ids, titles);
+    g_free(ids);
+    g_free(titles);
+    g_free(id_patterns);
+    g_free(title_patterns);
+}
 
 enum
 {
@@ -433,6 +466,34 @@ static void ww_display_class_init(WwDisplayClass* klass) {
                                                       G_TYPE_UINT64,
                                                       G_TYPE_BOOLEAN);
 
+    signals[SIGNAL_WINDOW_OBSERVATION_CONFIG] = g_signal_new("window-observation-config",
+                                                             G_TYPE_FROM_CLASS(klass),
+                                                             G_SIGNAL_RUN_LAST,
+                                                             0,
+                                                             NULL,
+                                                             NULL,
+                                                             NULL,
+                                                             G_TYPE_NONE,
+                                                             3,
+                                                             G_TYPE_UINT64,
+                                                             G_TYPE_STRV,
+                                                             G_TYPE_STRV);
+
+    signals[SIGNAL_WINDOW_OBSERVATION_RULES] = g_signal_new("window-observation-rules",
+                                                            G_TYPE_FROM_CLASS(klass),
+                                                            G_SIGNAL_RUN_LAST,
+                                                            0,
+                                                            NULL,
+                                                            NULL,
+                                                            NULL,
+                                                            G_TYPE_NONE,
+                                                            5,
+                                                            G_TYPE_UINT64,
+                                                            G_TYPE_STRV,
+                                                            G_TYPE_STRV,
+                                                            G_TYPE_STRV,
+                                                            G_TYPE_STRV);
+
     /* (err_code, message) */
     signals[SIGNAL_DISCONNECTED] = g_signal_new("disconnected",
                                                 G_TYPE_FROM_CLASS(klass),
@@ -500,6 +561,18 @@ gboolean ww_display_set_presentation_capabilities(WwDisplay* self, guint flags) 
     g_return_val_if_fail(WW_IS_DISPLAY(self), FALSE);
     g_return_val_if_fail(self->handle != NULL, FALSE);
     return waywallen_display_set_presentation_caps(self->handle, flags) == WAYWALLEN_OK;
+}
+
+gboolean ww_display_set_pause_effect_capabilities(WwDisplay* self, guint flags) {
+    g_return_val_if_fail(WW_IS_DISPLAY(self), FALSE);
+    g_return_val_if_fail(self->handle != NULL, FALSE);
+    return waywallen_display_set_pause_effect_caps(self->handle, flags) == WAYWALLEN_OK;
+}
+
+gboolean ww_display_set_transition_capabilities(WwDisplay* self, guint flags) {
+    g_return_val_if_fail(WW_IS_DISPLAY(self), FALSE);
+    g_return_val_if_fail(self->handle != NULL, FALSE);
+    return waywallen_display_set_transition_caps(self->handle, flags) == WAYWALLEN_OK;
 }
 
 gboolean ww_display_get_shadow_export(WwDisplay* self, gint* out_fd, guint* out_n_planes,
@@ -627,6 +700,20 @@ void ww_display_send_pointer_axis(WwDisplay* self, gdouble x, gdouble y, gdouble
 void ww_display_set_window_state(WwDisplay* self, guint flags) {
     if (! self->handle) return;
     (void)waywallen_display_set_window_state(self->handle, flags);
+}
+
+gboolean ww_display_set_window_observation_capabilities(WwDisplay* self, guint capabilities) {
+    g_return_val_if_fail(WW_IS_DISPLAY(self), FALSE);
+    return waywallen_display_set_window_observation_callback(
+               self->handle,
+               capabilities,
+               capabilities ? on_window_observation_config : NULL,
+               self) == WAYWALLEN_OK;
+}
+
+void ww_display_set_window_observation_state(WwDisplay* self, guint64 generation, guint flags) {
+    g_return_if_fail(WW_IS_DISPLAY(self));
+    (void)waywallen_display_set_window_observation_state(self->handle, generation, flags);
 }
 
 void ww_display_disconnect(WwDisplay* self) {

@@ -19,10 +19,49 @@ use core::ffi::{c_char, c_int, c_void};
 
 include!(concat!(env!("OUT_DIR"), "/version.rs"));
 pub const WAYWALLEN_DISPLAY_PROTOCOL_VERSION: u32 = 9;
+pub const WAYWALLEN_PAUSE_EFFECT_CAP_BLUR: u32 = 1 << 0;
+pub const WAYWALLEN_TRANSITION_CAP_FADE: u32 = 1 << 0;
+pub const WAYWALLEN_TRANSITION_CAP_WIPE: u32 = 1 << 1;
+pub const WAYWALLEN_TRANSITION_CAP_GROW: u32 = 1 << 2;
+#[deprecated(note = "use WAYWALLEN_PAUSE_EFFECT_CAP_BLUR")]
 pub const WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR: u32 = 1 << 0;
+#[deprecated(note = "use WAYWALLEN_TRANSITION_CAP_FADE")]
 pub const WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION: u32 = 1 << 1;
+#[deprecated(note = "use WAYWALLEN_TRANSITION_CAP_WIPE")]
 pub const WAYWALLEN_PRESENTATION_CAP_WIPE_TRANSITION: u32 = 1 << 2;
+#[deprecated(note = "use WAYWALLEN_TRANSITION_CAP_GROW")]
 pub const WAYWALLEN_PRESENTATION_CAP_GROW_TRANSITION: u32 = 1 << 3;
+
+#[repr(C)]
+pub struct ww_array_string_t {
+    pub count: u32,
+    pub data: *mut *mut c_char,
+}
+
+impl ww_array_string_t {
+    /// # Safety
+    /// Entries must be valid NUL-terminated strings for the duration of this call.
+    pub unsafe fn to_vec(&self) -> Vec<String> {
+        (0..self.count as usize)
+            .map(|index| {
+                std::ffi::CStr::from_ptr(*self.data.add(index))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
+    }
+}
+
+#[repr(C)]
+pub struct waywallen_window_observation_config_t {
+    pub generation: u64,
+    pub excluded_application_ids: ww_array_string_t,
+    pub excluded_titles: ww_array_string_t,
+    pub has_excluded_application_id_patterns: bool,
+    pub excluded_application_id_patterns: ww_array_string_t,
+    pub has_excluded_title_patterns: bool,
+    pub excluded_title_patterns: ww_array_string_t,
+}
 
 // -----------------------------------------------------------------------------
 // Return codes
@@ -425,6 +464,14 @@ extern "C" {
         major: u32,
         minor: u32,
     ) -> c_int;
+    pub fn waywallen_display_set_pause_effect_caps(
+        d: *mut waywallen_display_t,
+        flags: u32,
+    ) -> c_int;
+    pub fn waywallen_display_set_transition_caps(d: *mut waywallen_display_t, flags: u32) -> c_int;
+    #[deprecated(
+        note = "use waywallen_display_set_pause_effect_caps and waywallen_display_set_transition_caps"
+    )]
     pub fn waywallen_display_set_presentation_caps(
         d: *mut waywallen_display_t,
         flags: u32,
@@ -458,6 +505,19 @@ extern "C" {
     ) -> c_int;
 
     pub fn waywallen_display_set_window_state(d: *mut waywallen_display_t, flags: u32) -> c_int;
+    pub fn waywallen_display_set_window_observation_callback(
+        d: *mut waywallen_display_t,
+        capabilities: u32,
+        callback: Option<
+            unsafe extern "C" fn(*mut c_void, *const waywallen_window_observation_config_t),
+        >,
+        user_data: *mut c_void,
+    ) -> c_int;
+    pub fn waywallen_display_set_window_observation_state(
+        d: *mut waywallen_display_t,
+        generation: u64,
+        flags: u32,
+    ) -> c_int;
 
     pub fn waywallen_display_get_fd(d: *mut waywallen_display_t) -> c_int;
     pub fn waywallen_display_wants_writable(d: *mut waywallen_display_t) -> bool;

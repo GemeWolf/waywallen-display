@@ -1,0 +1,222 @@
+[
+  {
+    "pattern": "",
+    "value": "",
+    "matched": true
+  },
+  {
+    "pattern": "",
+    "value": "x",
+    "matched": false
+  },
+  {
+    "pattern": "*",
+    "value": "",
+    "matched": true
+  },
+  {
+    "pattern": "*",
+    "value": "abc",
+    "matched": true
+  },
+  {
+    "pattern": "?",
+    "value": "",
+    "matched": false
+  },
+  {
+    "pattern": "?",
+    "value": "a",
+    "matched": true
+  },
+  {
+    "pattern": "?",
+    "value": "ab",
+    "matched": false
+  },
+  {
+    "pattern": "cat",
+    "value": "cat",
+    "matched": true
+  },
+  {
+    "pattern": "cat",
+    "value": "Cat",
+    "matched": false
+  },
+  {
+    "pattern": "cat",
+    "value": "bobcat",
+    "matched": false
+  },
+  {
+    "pattern": "cat",
+    "value": "catfish",
+    "matched": false
+  },
+  {
+    "pattern": "*cat*",
+    "value": "bobcatfish",
+    "matched": true
+  },
+  {
+    "pattern": "org.*",
+    "value": "org.example.Cat",
+    "matched": true
+  },
+  {
+    "pattern": "org.*",
+    "value": "xorg.example",
+    "matched": false
+  },
+  {
+    "pattern": "a?c",
+    "value": "abc",
+    "matched": true
+  },
+  {
+    "pattern": "a?c",
+    "value": "ac",
+    "matched": false
+  },
+  {
+    "pattern": "a**b",
+    "value": "ab",
+    "matched": true
+  },
+  {
+    "pattern": "a**b",
+    "value": "axxb",
+    "matched": true
+  },
+  {
+    "pattern": "*?*",
+    "value": "",
+    "matched": false
+  },
+  {
+    "pattern": "*?*",
+    "value": "猫",
+    "matched": true
+  },
+  {
+    "pattern": "?",
+    "value": "猫",
+    "matched": true
+  },
+  {
+    "pattern": "?",
+    "value": "😀",
+    "matched": true
+  },
+  {
+    "pattern": "??",
+    "value": "é",
+    "matched": true
+  },
+  {
+    "pattern": "?",
+    "value": "é",
+    "matched": false
+  },
+  {
+    "pattern": "猫?",
+    "value": "猫咪",
+    "matched": true
+  },
+  {
+    "pattern": "*",
+    "value": "a/b",
+    "matched": true
+  },
+  {
+    "pattern": "a?b",
+    "value": "a/b",
+    "matched": true
+  },
+  {
+    "pattern": "?",
+    "value": "\n",
+    "matched": true
+  },
+  {
+    "pattern": "*",
+    "value": "a\nb",
+    "matched": true
+  },
+  {
+    "pattern": "a?b",
+    "value": "a\nb",
+    "matched": true
+  },
+  {
+    "pattern": "cat",
+    "value": "cat\n",
+    "matched": false
+  },
+  {
+    "pattern": "[ab]",
+    "value": "a",
+    "matched": false
+  },
+  {
+    "pattern": "[ab]",
+    "value": "[ab]",
+    "matched": true
+  },
+  {
+    "pattern": "{a,b}",
+    "value": "a",
+    "matched": false
+  },
+  {
+    "pattern": "{a,b}",
+    "value": "{a,b}",
+    "matched": true
+  },
+  {
+    "pattern": "\\*",
+    "value": "\\abc",
+    "matched": true
+  },
+  {
+    "pattern": "\\*",
+    "value": "abc",
+    "matched": false
+  },
+  {
+    "pattern": "\\?",
+    "value": "\\猫",
+    "matched": true
+  },
+  {
+    "pattern": "a.b",
+    "value": "axb",
+    "matched": false
+  },
+  {
+    "pattern": "a.b",
+    "value": "a.b",
+    "matched": true
+  },
+  {
+    "pattern": "^$+().|",
+    "value": "^$+().|",
+    "matched": true
+  },
+  {
+    "pattern": "***",
+    "value": "hello",
+    "matched": true
+  },
+  {
+    "pattern": "*a*a*a*a*b",
+    "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "matched": false
+  },
+  {
+    "pattern": "***************************************************************************************************************************************************************************************************************************************************************b",
+    "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "matched": false
+  }
+]

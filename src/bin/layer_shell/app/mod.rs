@@ -163,8 +163,9 @@ struct App {
     name_prefix: String,
     pointers: HashMap<u32, PointerCtx>,
     binding_registry: watcher::BindingRegistry,
-    window_states: HashMap<String, u32>,
+    window_states: HashMap<String, Vec<watcher::Window>>,
     watcher_commands: watcher::CommandReceiver,
+    window_observation_available: bool,
     vulkan: Option<Arc<vulkan::VulkanRuntime>>,
 }
 
@@ -199,6 +200,7 @@ impl App {
             binding_registry: watcher::new_registry(),
             window_states: HashMap::new(),
             watcher_commands,
+            window_observation_available: false,
             vulkan: None,
         }
     }
@@ -366,9 +368,10 @@ impl App {
             match command {
                 watcher::Command::WindowState {
                     display_name,
-                    flags,
+                    windows,
                 } => {
-                    self.window_states.insert(display_name.clone(), flags);
+                    self.window_states
+                        .insert(display_name.clone(), windows.clone());
                     let target = self.outputs.values().find_map(|entry| {
                         let binding = entry.binding.as_ref()?;
                         (binding.display_name == display_name).then_some((binding, &entry.session))
@@ -376,16 +379,17 @@ impl App {
                     let Some((binding, session)) = target else {
                         continue;
                     };
-                    binding.watcher.replace_window_flags(flags);
+                    if !binding.watcher.replace_windows(windows) {
+                        continue;
+                    }
                     let Some(session) = session.as_ref() else {
                         continue;
                     };
                     if matches!(session.state, DisplaySessionState::Retiring { .. }) {
                         continue;
                     }
-                    let rc = unsafe {
-                        sys::waywallen_display_set_window_state(session.display.0, flags)
-                    };
+                    let flags = binding.watcher.window_flags();
+                    let rc = session::publish_window_state(binding, session.display.0);
                     if rc >= 0 {
                         log::debug!(
                             "watcher: [{}] window_state flags=0x{flags:x}",
@@ -501,7 +505,8 @@ pub(super) fn run(socket: PathBuf, name_prefix: String) -> Result<()> {
         watcher::command_channel().context("create watcher command channel")?;
     let mut app = App::new(socket, name_prefix, watcher_commands);
 
-    watcher::spawn_all(app.binding_registry.clone(), watcher_sender);
+    app.window_observation_available =
+        watcher::spawn_all(app.binding_registry.clone(), watcher_sender);
 
     // Diagnostics aid: run the watchers without registering any display,
     // logging the window-state flags they would feed the daemon.
@@ -512,8 +517,11 @@ pub(super) fn run(socket: PathBuf, name_prefix: String) -> Result<()> {
                 match command {
                     watcher::Command::WindowState {
                         display_name,
-                        flags,
-                    } => log::info!("probe: {display_name} flags=0x{flags:x}"),
+                        windows,
+                    } => log::info!(
+                        "probe: {display_name} flags=0x{:x}",
+                        windows.iter().fold(0, |flags, window| flags | window.flags)
+                    ),
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(200));

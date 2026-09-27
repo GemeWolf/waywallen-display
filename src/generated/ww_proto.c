@@ -404,6 +404,104 @@ static void free_kv_list(ww_kv_list_t *a) {
  * Per-message implementations
  * ====================================================================== */
 
+
+static void tagged_patch_u32(ww_buf_t *b, size_t pos, uint32_t value) {
+    for (size_t i = 0; i < 4; ++i) b->data[pos + i] = (uint8_t)(value >> (8 * i));
+}
+
+typedef struct {
+    ww_rd_t body;
+    uint32_t tags[256];
+    size_t count;
+} ww_tagged_reader_t;
+
+static int tagged_begin(ww_rd_t *r, ww_tagged_reader_t *out) {
+    uint32_t revision, len;
+    int rc = rd_u32(r, &revision);
+    if (rc) return rc;
+    if ((rc = rd_u32(r, &len))) return rc;
+    if (len > 65520 || len % 4 != 0) return WW_ERR_BAD_ARRAY;
+    if ((rc = rd_need(r, len))) return rc;
+    out->body = (ww_rd_t){r->buf + r->pos, 0, revision == 1 ? len : 0};
+    out->count = 0;
+    r->pos += len;
+    return WW_OK;
+}
+
+static int tagged_next(ww_tagged_reader_t *r, uint32_t *tag, uint32_t *kind, ww_rd_t *value) {
+    uint32_t len;
+    int rc;
+    if (r->count == 256) return WW_ERR_BAD_ARRAY;
+    if ((rc = rd_u32(&r->body, tag))) return rc;
+    if ((rc = rd_u32(&r->body, kind))) return rc;
+    if ((rc = rd_u32(&r->body, &len))) return rc;
+    if (*tag == 0 || len % 4 != 0) return WW_ERR_BAD_ARRAY;
+    for (size_t i = 0; i < r->count; ++i) {
+        if (r->tags[i] == *tag) return WW_ERR_BAD_ARRAY;
+    }
+    r->tags[r->count++] = *tag;
+    if ((rc = rd_need(&r->body, len))) return rc;
+    *value = (ww_rd_t){r->body.buf + r->body.pos, 0, len};
+    r->body.pos += len;
+    return WW_OK;
+}
+
+static bool tagged_utf8(const uint8_t *s, size_t len) {
+    for (size_t i = 0; i < len;) {
+        uint32_t c = s[i++];
+        if (c < 0x80) continue;
+        size_t n;
+        uint32_t minimum;
+        if (c >= 0xc2 && c <= 0xdf) { n = 1; minimum = 0x80; c &= 0x1f; }
+        else if (c >= 0xe0 && c <= 0xef) { n = 2; minimum = 0x800; c &= 0x0f; }
+        else if (c >= 0xf0 && c <= 0xf4) { n = 3; minimum = 0x10000; c &= 7; }
+        else return false;
+        if (n > len - i) return false;
+        while (n--) {
+            if ((s[i] & 0xc0) != 0x80) return false;
+            c = (c << 6) | (s[i++] & 0x3f);
+        }
+        if (c < minimum || c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff)) return false;
+    }
+    return true;
+}
+
+static int tagged_validate_value(uint32_t kind, ww_rd_t *r) {
+    uint32_t len;
+    int rc;
+    if (kind >= 0x100 || kind == 9) {
+        if ((rc = rd_u32(r, &len))) return rc;
+        if (len > 1024) return WW_ERR_BAD_ARRAY;
+        for (uint32_t i = 0; i < len; ++i) {
+            if ((rc = tagged_validate_value(kind == 9 ? 8 : kind - 0x100, r))) return rc;
+            if (kind == 9 && (rc = tagged_validate_value(8, r))) return rc;
+        }
+        return WW_OK;
+    }
+    if (kind == 8) {
+        if ((rc = rd_u32(r, &len))) return rc;
+        if (len == 0 || len > 4097) return WW_ERR_BAD_STRING;
+        size_t padded = ((size_t)len + 3) & ~(size_t)3;
+        if ((rc = rd_need(r, padded))) return rc;
+        const uint8_t *s = r->buf + r->pos;
+        if (memchr(s, 0, len - 1) || !tagged_utf8(s, len - 1)) return WW_ERR_BAD_STRING;
+        for (size_t i = len - 1; i < padded; ++i) if (s[i]) return WW_ERR_BAD_STRING;
+        r->pos += padded;
+        return WW_OK;
+    }
+    if (kind == 11) {
+        uint32_t revision;
+        if ((rc = rd_u32(r, &revision))) return rc;
+        if ((rc = rd_u32(r, &len))) return rc;
+    } else len = (kind == 4 || kind == 5 || kind == 7) ? 8 : (kind == 10 ? 16 : 4);
+    if ((rc = rd_need(r, len))) return rc;
+    r->pos += len;
+    return WW_OK;
+}
+
+static int tagged_validate(uint32_t kind, ww_rd_t value) {
+    return tagged_validate_value(kind, &value);
+}
 static int w_pause_effect_kind(ww_buf_t *b, waywallen_pause_effect_kind_t v) {
     return w_u32(b, (uint32_t)v);
 }
@@ -659,6 +757,59 @@ void waywallen_display_metrics_free(waywallen_display_metrics_t *value) {
     memset(value, 0, sizeof(*value));
 }
 
+static int w_pause_effect_capabilities(ww_buf_t *b, const waywallen_pause_effect_capabilities_t *v) {
+    int rc;
+    if ((rc = w_u32(b, 1))) return rc;
+    size_t body_length_pos = b->len;
+    if ((rc = w_u32(b, 0))) return rc;
+    {
+        if ((rc = w_u32(b, 1))) return rc;
+        if ((rc = w_u32(b, 2))) return rc;
+        size_t length_pos = b->len;
+        if ((rc = w_u32(b, 0))) return rc;
+        if ((rc = w_u32(b, v->flags))) return rc;
+        if (b->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(b, length_pos, (uint32_t)(b->len - length_pos - 4));
+    }
+    if (b->len - body_length_pos - 4 > 65520) return WW_ERR_OVERFLOW;
+    tagged_patch_u32(b, body_length_pos, (uint32_t)(b->len - body_length_pos - 4));
+    return WW_OK;
+}
+
+static int rd_pause_effect_capabilities(ww_rd_t *r, waywallen_pause_effect_capabilities_t *v) {
+    int rc;
+    ww_tagged_reader_t fields;
+    if ((rc = tagged_begin(r, &fields))) return rc;
+    bool seen_flags = false;
+    while (fields.body.pos != fields.body.len) {
+        uint32_t tag, kind;
+        ww_rd_t field;
+        if ((rc = tagged_next(&fields, &tag, &kind, &field))) return rc;
+        switch (tag) {
+        case 1:
+            if (kind != 2) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_u32(&field, &v->flags))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            seen_flags = true;
+            break;
+        default: break;
+        }
+    }
+    if (!seen_flags) return WW_ERR_SHORT;
+    return WW_OK;
+}
+
+static void free_pause_effect_capabilities(waywallen_pause_effect_capabilities_t *v) {
+    (void)v;
+}
+
+void waywallen_pause_effect_capabilities_free(waywallen_pause_effect_capabilities_t *value) {
+    if (!value) return;
+    free_pause_effect_capabilities(value);
+    memset(value, 0, sizeof(*value));
+}
+
 static int w_pause_effect_config(ww_buf_t *b, const waywallen_pause_effect_config_t *v) {
     int rc;
     if ((rc = w_pause_effect_kind(b, v->kind))) return rc;
@@ -832,6 +983,236 @@ static void free_presentation_snapshot(waywallen_presentation_snapshot_t *v) {
 void waywallen_presentation_snapshot_free(waywallen_presentation_snapshot_t *value) {
     if (!value) return;
     free_presentation_snapshot(value);
+    memset(value, 0, sizeof(*value));
+}
+
+static int w_transition_capabilities(ww_buf_t *b, const waywallen_transition_capabilities_t *v) {
+    int rc;
+    if ((rc = w_u32(b, 1))) return rc;
+    size_t body_length_pos = b->len;
+    if ((rc = w_u32(b, 0))) return rc;
+    {
+        if ((rc = w_u32(b, 1))) return rc;
+        if ((rc = w_u32(b, 2))) return rc;
+        size_t length_pos = b->len;
+        if ((rc = w_u32(b, 0))) return rc;
+        if ((rc = w_u32(b, v->flags))) return rc;
+        if (b->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(b, length_pos, (uint32_t)(b->len - length_pos - 4));
+    }
+    if (b->len - body_length_pos - 4 > 65520) return WW_ERR_OVERFLOW;
+    tagged_patch_u32(b, body_length_pos, (uint32_t)(b->len - body_length_pos - 4));
+    return WW_OK;
+}
+
+static int rd_transition_capabilities(ww_rd_t *r, waywallen_transition_capabilities_t *v) {
+    int rc;
+    ww_tagged_reader_t fields;
+    if ((rc = tagged_begin(r, &fields))) return rc;
+    bool seen_flags = false;
+    while (fields.body.pos != fields.body.len) {
+        uint32_t tag, kind;
+        ww_rd_t field;
+        if ((rc = tagged_next(&fields, &tag, &kind, &field))) return rc;
+        switch (tag) {
+        case 1:
+            if (kind != 2) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_u32(&field, &v->flags))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            seen_flags = true;
+            break;
+        default: break;
+        }
+    }
+    if (!seen_flags) return WW_ERR_SHORT;
+    return WW_OK;
+}
+
+static void free_transition_capabilities(waywallen_transition_capabilities_t *v) {
+    (void)v;
+}
+
+void waywallen_transition_capabilities_free(waywallen_transition_capabilities_t *value) {
+    if (!value) return;
+    free_transition_capabilities(value);
+    memset(value, 0, sizeof(*value));
+}
+
+static int w_window_observation_capabilities(ww_buf_t *b, const waywallen_window_observation_capabilities_t *v) {
+    int rc;
+    if ((rc = w_u32(b, 1))) return rc;
+    size_t body_length_pos = b->len;
+    if ((rc = w_u32(b, 0))) return rc;
+    {
+        if ((rc = w_u32(b, 1))) return rc;
+        if ((rc = w_u32(b, 2))) return rc;
+        size_t length_pos = b->len;
+        if ((rc = w_u32(b, 0))) return rc;
+        if ((rc = w_u32(b, v->flags))) return rc;
+        if (b->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(b, length_pos, (uint32_t)(b->len - length_pos - 4));
+    }
+    if (b->len - body_length_pos - 4 > 65520) return WW_ERR_OVERFLOW;
+    tagged_patch_u32(b, body_length_pos, (uint32_t)(b->len - body_length_pos - 4));
+    return WW_OK;
+}
+
+static int rd_window_observation_capabilities(ww_rd_t *r, waywallen_window_observation_capabilities_t *v) {
+    int rc;
+    ww_tagged_reader_t fields;
+    if ((rc = tagged_begin(r, &fields))) return rc;
+    bool seen_flags = false;
+    while (fields.body.pos != fields.body.len) {
+        uint32_t tag, kind;
+        ww_rd_t field;
+        if ((rc = tagged_next(&fields, &tag, &kind, &field))) return rc;
+        switch (tag) {
+        case 1:
+            if (kind != 2) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_u32(&field, &v->flags))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            seen_flags = true;
+            break;
+        default: break;
+        }
+    }
+    if (!seen_flags) return WW_ERR_SHORT;
+    return WW_OK;
+}
+
+static void free_window_observation_capabilities(waywallen_window_observation_capabilities_t *v) {
+    (void)v;
+}
+
+void waywallen_window_observation_capabilities_free(waywallen_window_observation_capabilities_t *value) {
+    if (!value) return;
+    free_window_observation_capabilities(value);
+    memset(value, 0, sizeof(*value));
+}
+
+static int w_window_observation_config(ww_buf_t *b, const waywallen_window_observation_config_t *v) {
+    int rc;
+    if ((rc = w_u32(b, 1))) return rc;
+    size_t body_length_pos = b->len;
+    if ((rc = w_u32(b, 0))) return rc;
+    {
+        if ((rc = w_u32(b, 1))) return rc;
+        if ((rc = w_u32(b, 4))) return rc;
+        size_t length_pos = b->len;
+        if ((rc = w_u32(b, 0))) return rc;
+        if ((rc = w_u64(b, v->generation))) return rc;
+        if (b->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(b, length_pos, (uint32_t)(b->len - length_pos - 4));
+    }
+    {
+        if ((rc = w_u32(b, 2))) return rc;
+        if ((rc = w_u32(b, 264))) return rc;
+        size_t length_pos = b->len;
+        if ((rc = w_u32(b, 0))) return rc;
+        if ((rc = w_array_string(b, &v->excluded_application_ids))) return rc;
+        if (b->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(b, length_pos, (uint32_t)(b->len - length_pos - 4));
+    }
+    {
+        if ((rc = w_u32(b, 3))) return rc;
+        if ((rc = w_u32(b, 264))) return rc;
+        size_t length_pos = b->len;
+        if ((rc = w_u32(b, 0))) return rc;
+        if ((rc = w_array_string(b, &v->excluded_titles))) return rc;
+        if (b->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(b, length_pos, (uint32_t)(b->len - length_pos - 4));
+    }
+    if (v->has_excluded_application_id_patterns) {
+        if ((rc = w_u32(b, 4))) return rc;
+        if ((rc = w_u32(b, 264))) return rc;
+        size_t length_pos = b->len;
+        if ((rc = w_u32(b, 0))) return rc;
+        if ((rc = w_array_string(b, &v->excluded_application_id_patterns))) return rc;
+        if (b->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(b, length_pos, (uint32_t)(b->len - length_pos - 4));
+    }
+    if (v->has_excluded_title_patterns) {
+        if ((rc = w_u32(b, 5))) return rc;
+        if ((rc = w_u32(b, 264))) return rc;
+        size_t length_pos = b->len;
+        if ((rc = w_u32(b, 0))) return rc;
+        if ((rc = w_array_string(b, &v->excluded_title_patterns))) return rc;
+        if (b->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(b, length_pos, (uint32_t)(b->len - length_pos - 4));
+    }
+    if (b->len - body_length_pos - 4 > 65520) return WW_ERR_OVERFLOW;
+    tagged_patch_u32(b, body_length_pos, (uint32_t)(b->len - body_length_pos - 4));
+    return WW_OK;
+}
+
+static int rd_window_observation_config(ww_rd_t *r, waywallen_window_observation_config_t *v) {
+    int rc;
+    ww_tagged_reader_t fields;
+    if ((rc = tagged_begin(r, &fields))) return rc;
+    bool seen_generation = false;
+    bool seen_excluded_application_ids = false;
+    bool seen_excluded_titles = false;
+    while (fields.body.pos != fields.body.len) {
+        uint32_t tag, kind;
+        ww_rd_t field;
+        if ((rc = tagged_next(&fields, &tag, &kind, &field))) return rc;
+        switch (tag) {
+        case 1:
+            if (kind != 4) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_u64(&field, &v->generation))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            seen_generation = true;
+            break;
+        case 2:
+            if (kind != 264) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_array_string(&field, &v->excluded_application_ids))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            seen_excluded_application_ids = true;
+            break;
+        case 3:
+            if (kind != 264) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_array_string(&field, &v->excluded_titles))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            seen_excluded_titles = true;
+            break;
+        case 4:
+            if (kind != 264) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_array_string(&field, &v->excluded_application_id_patterns))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            v->has_excluded_application_id_patterns = true;
+            break;
+        case 5:
+            if (kind != 264) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_array_string(&field, &v->excluded_title_patterns))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            v->has_excluded_title_patterns = true;
+            break;
+        default: break;
+        }
+    }
+    if (!seen_generation) return WW_ERR_SHORT;
+    if (!seen_excluded_application_ids) return WW_ERR_SHORT;
+    if (!seen_excluded_titles) return WW_ERR_SHORT;
+    return WW_OK;
+}
+
+static void free_window_observation_config(waywallen_window_observation_config_t *v) {
+    free_array_string(&v->excluded_application_ids);
+    free_array_string(&v->excluded_titles);
+    free_array_string(&v->excluded_application_id_patterns);
+    free_array_string(&v->excluded_title_patterns);
+}
+
+void waywallen_window_observation_config_free(waywallen_window_observation_config_t *value) {
+    if (!value) return;
+    free_window_observation_config(value);
     memset(value, 0, sizeof(*value));
 }
 
@@ -1218,6 +1599,198 @@ uint32_t ww_req_frame_release_armed_expected_fds(const ww_req_frame_release_arme
     return 0;
 }
 
+static int ww_req_client_capabilities_read(ww_rd_t *reader, ww_req_client_capabilities_t *value) {
+    int rc;
+    (void)value;
+    ww_tagged_reader_t fields;
+    if ((rc = tagged_begin(reader, &fields))) return rc;
+    while (fields.body.pos != fields.body.len) {
+        uint32_t tag, kind;
+        ww_rd_t field;
+        if ((rc = tagged_next(&fields, &tag, &kind, &field))) return rc;
+        switch (tag) {
+        case 1:
+            if (kind != 11) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_window_observation_capabilities(&field, &value->window_observation))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            value->has_window_observation = true;
+            break;
+        case 2:
+            if (kind != 11) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_pause_effect_capabilities(&field, &value->pause_effect))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            value->has_pause_effect = true;
+            break;
+        case 3:
+            if (kind != 11) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_transition_capabilities(&field, &value->transition))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            value->has_transition = true;
+            break;
+        default: break;
+        }
+    }
+    return WW_OK;
+}
+
+int ww_req_client_capabilities_encode(const ww_req_client_capabilities_t *m, ww_buf_t *out) {
+    int rc;
+    (void)m;
+    if ((rc = w_u32(out, 1))) return rc;
+    size_t body_length_pos = out->len;
+    if ((rc = w_u32(out, 0))) return rc;
+    if (m->has_window_observation) {
+        if ((rc = w_u32(out, 1))) return rc;
+        if ((rc = w_u32(out, 11))) return rc;
+        size_t length_pos = out->len;
+        if ((rc = w_u32(out, 0))) return rc;
+        if ((rc = w_window_observation_capabilities(out, &m->window_observation))) return rc;
+        if (out->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(out, length_pos, (uint32_t)(out->len - length_pos - 4));
+    }
+    if (m->has_pause_effect) {
+        if ((rc = w_u32(out, 2))) return rc;
+        if ((rc = w_u32(out, 11))) return rc;
+        size_t length_pos = out->len;
+        if ((rc = w_u32(out, 0))) return rc;
+        if ((rc = w_pause_effect_capabilities(out, &m->pause_effect))) return rc;
+        if (out->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(out, length_pos, (uint32_t)(out->len - length_pos - 4));
+    }
+    if (m->has_transition) {
+        if ((rc = w_u32(out, 3))) return rc;
+        if ((rc = w_u32(out, 11))) return rc;
+        size_t length_pos = out->len;
+        if ((rc = w_u32(out, 0))) return rc;
+        if ((rc = w_transition_capabilities(out, &m->transition))) return rc;
+        if (out->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(out, length_pos, (uint32_t)(out->len - length_pos - 4));
+    }
+    if (out->len - body_length_pos - 4 > 65520) return WW_ERR_OVERFLOW;
+    tagged_patch_u32(out, body_length_pos, (uint32_t)(out->len - body_length_pos - 4));
+    return WW_OK;
+}
+
+int ww_req_client_capabilities_decode(const uint8_t *buf, size_t len, ww_req_client_capabilities_t *out) {
+    memset(out, 0, sizeof(*out));
+    ww_rd_t r = { buf, 0, len };
+    int rc;
+    if ((rc = ww_req_client_capabilities_read(&r, out))) goto fail;
+    if (r.pos != r.len) {
+        int rc2 = WW_ERR_TRAILING;
+        (void)rc2;
+        ww_req_client_capabilities_free(out);
+        return WW_ERR_TRAILING;
+    }
+    return WW_OK;
+fail:
+    ww_req_client_capabilities_free(out);
+    return rc;
+}
+
+void ww_req_client_capabilities_free(ww_req_client_capabilities_t *m) {
+    free_window_observation_capabilities(&m->window_observation);
+    free_pause_effect_capabilities(&m->pause_effect);
+    free_transition_capabilities(&m->transition);
+}
+
+uint32_t ww_req_client_capabilities_expected_fds(const ww_req_client_capabilities_t *m) {
+    (void)m;
+    return 0;
+}
+
+static int ww_req_set_window_observation_state_read(ww_rd_t *reader, ww_req_set_window_observation_state_t *value) {
+    int rc;
+    (void)value;
+    ww_tagged_reader_t fields;
+    if ((rc = tagged_begin(reader, &fields))) return rc;
+    bool seen_config_generation = false;
+    bool seen_flags = false;
+    while (fields.body.pos != fields.body.len) {
+        uint32_t tag, kind;
+        ww_rd_t field;
+        if ((rc = tagged_next(&fields, &tag, &kind, &field))) return rc;
+        switch (tag) {
+        case 1:
+            if (kind != 4) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_u64(&field, &value->config_generation))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            seen_config_generation = true;
+            break;
+        case 2:
+            if (kind != 2) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_u32(&field, &value->flags))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            seen_flags = true;
+            break;
+        default: break;
+        }
+    }
+    if (!seen_config_generation) return WW_ERR_SHORT;
+    if (!seen_flags) return WW_ERR_SHORT;
+    return WW_OK;
+}
+
+int ww_req_set_window_observation_state_encode(const ww_req_set_window_observation_state_t *m, ww_buf_t *out) {
+    int rc;
+    (void)m;
+    if ((rc = w_u32(out, 1))) return rc;
+    size_t body_length_pos = out->len;
+    if ((rc = w_u32(out, 0))) return rc;
+    {
+        if ((rc = w_u32(out, 1))) return rc;
+        if ((rc = w_u32(out, 4))) return rc;
+        size_t length_pos = out->len;
+        if ((rc = w_u32(out, 0))) return rc;
+        if ((rc = w_u64(out, m->config_generation))) return rc;
+        if (out->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(out, length_pos, (uint32_t)(out->len - length_pos - 4));
+    }
+    {
+        if ((rc = w_u32(out, 2))) return rc;
+        if ((rc = w_u32(out, 2))) return rc;
+        size_t length_pos = out->len;
+        if ((rc = w_u32(out, 0))) return rc;
+        if ((rc = w_u32(out, m->flags))) return rc;
+        if (out->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(out, length_pos, (uint32_t)(out->len - length_pos - 4));
+    }
+    if (out->len - body_length_pos - 4 > 65520) return WW_ERR_OVERFLOW;
+    tagged_patch_u32(out, body_length_pos, (uint32_t)(out->len - body_length_pos - 4));
+    return WW_OK;
+}
+
+int ww_req_set_window_observation_state_decode(const uint8_t *buf, size_t len, ww_req_set_window_observation_state_t *out) {
+    memset(out, 0, sizeof(*out));
+    ww_rd_t r = { buf, 0, len };
+    int rc;
+    if ((rc = ww_req_set_window_observation_state_read(&r, out))) goto fail;
+    if (r.pos != r.len) {
+        int rc2 = WW_ERR_TRAILING;
+        (void)rc2;
+        ww_req_set_window_observation_state_free(out);
+        return WW_ERR_TRAILING;
+    }
+    return WW_OK;
+fail:
+    ww_req_set_window_observation_state_free(out);
+    return rc;
+}
+
+void ww_req_set_window_observation_state_free(ww_req_set_window_observation_state_t *m) {
+    (void)m;
+}
+
+uint32_t ww_req_set_window_observation_state_expected_fds(const ww_req_set_window_observation_state_t *m) {
+    (void)m;
+    return 0;
+}
+
 int ww_evt_welcome_encode(const ww_evt_welcome_t *m, ww_buf_t *out) {
     int rc;
     (void)m;
@@ -1545,6 +2118,77 @@ void ww_evt_set_presentation_state_free(ww_evt_set_presentation_state_t *m) {
 }
 
 uint32_t ww_evt_set_presentation_state_expected_fds(const ww_evt_set_presentation_state_t *m) {
+    (void)m;
+    return 0;
+}
+
+static int ww_evt_set_window_observation_config_read(ww_rd_t *reader, ww_evt_set_window_observation_config_t *value) {
+    int rc;
+    (void)value;
+    ww_tagged_reader_t fields;
+    if ((rc = tagged_begin(reader, &fields))) return rc;
+    bool seen_config = false;
+    while (fields.body.pos != fields.body.len) {
+        uint32_t tag, kind;
+        ww_rd_t field;
+        if ((rc = tagged_next(&fields, &tag, &kind, &field))) return rc;
+        switch (tag) {
+        case 1:
+            if (kind != 11) return WW_ERR_BAD_ARRAY;
+            if ((rc = tagged_validate(kind, field))) return rc;
+            if ((rc = rd_window_observation_config(&field, &value->config))) return rc;
+            if (field.pos != field.len) return WW_ERR_TRAILING;
+            seen_config = true;
+            break;
+        default: break;
+        }
+    }
+    if (!seen_config) return WW_ERR_SHORT;
+    return WW_OK;
+}
+
+int ww_evt_set_window_observation_config_encode(const ww_evt_set_window_observation_config_t *m, ww_buf_t *out) {
+    int rc;
+    (void)m;
+    if ((rc = w_u32(out, 1))) return rc;
+    size_t body_length_pos = out->len;
+    if ((rc = w_u32(out, 0))) return rc;
+    {
+        if ((rc = w_u32(out, 1))) return rc;
+        if ((rc = w_u32(out, 11))) return rc;
+        size_t length_pos = out->len;
+        if ((rc = w_u32(out, 0))) return rc;
+        if ((rc = w_window_observation_config(out, &m->config))) return rc;
+        if (out->len - length_pos - 4 > UINT32_MAX) return WW_ERR_OVERFLOW;
+        tagged_patch_u32(out, length_pos, (uint32_t)(out->len - length_pos - 4));
+    }
+    if (out->len - body_length_pos - 4 > 65520) return WW_ERR_OVERFLOW;
+    tagged_patch_u32(out, body_length_pos, (uint32_t)(out->len - body_length_pos - 4));
+    return WW_OK;
+}
+
+int ww_evt_set_window_observation_config_decode(const uint8_t *buf, size_t len, ww_evt_set_window_observation_config_t *out) {
+    memset(out, 0, sizeof(*out));
+    ww_rd_t r = { buf, 0, len };
+    int rc;
+    if ((rc = ww_evt_set_window_observation_config_read(&r, out))) goto fail;
+    if (r.pos != r.len) {
+        int rc2 = WW_ERR_TRAILING;
+        (void)rc2;
+        ww_evt_set_window_observation_config_free(out);
+        return WW_ERR_TRAILING;
+    }
+    return WW_OK;
+fail:
+    ww_evt_set_window_observation_config_free(out);
+    return rc;
+}
+
+void ww_evt_set_window_observation_config_free(ww_evt_set_window_observation_config_t *m) {
+    free_window_observation_config(&m->config);
+}
+
+uint32_t ww_evt_set_window_observation_config_expected_fds(const ww_evt_set_window_observation_config_t *m) {
     (void)m;
     return 0;
 }

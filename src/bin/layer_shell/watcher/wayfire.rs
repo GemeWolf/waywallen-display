@@ -1,4 +1,4 @@
-use crate::watcher::{BindingRegistry, Command, CommandSender, OutputInfo};
+use crate::watcher::{BindingRegistry, Command, CommandSender};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -8,7 +8,6 @@ use std::io::{Read, Write};
 use std::num::TryFromIntError;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::sync::Arc;
 use std::{io, thread};
 use thiserror::Error;
 use waywallen_display::{
@@ -110,10 +109,6 @@ impl<W: Read> WFSocket<W> {
         self.socket
             .read_exact(&mut buf)
             .map_err(Error::ReceiveMessage)?;
-        log::trace!(
-            "wayfire_watcher: received response: {}",
-            String::from_utf8_lossy(buf.as_slice())
-        );
         serde_json::from_slice(&buf).map_err(Error::DeserializeMessage)
     }
 }
@@ -148,6 +143,18 @@ pub enum EventKind {
     ViewMapped,
     #[serde(rename = "view-unmapped")]
     ViewUnmapped,
+    #[serde(rename = "view-title-changed")]
+    ViewTitleChanged,
+    #[serde(rename = "view-app-id-changed")]
+    ViewAppIdChanged,
+    #[serde(rename = "view-tiled")]
+    ViewTiled,
+    #[serde(rename = "view-set-output")]
+    ViewSetOutput,
+    #[serde(rename = "view-workspace-changed")]
+    ViewWorkspaceChanged,
+    #[serde(rename = "wset-workspace-changed")]
+    WorkspaceChanged,
 }
 
 #[derive(Serialize)]
@@ -157,6 +164,10 @@ pub struct EventRequest<'a> {
 
 #[derive(Deserialize, Debug, PartialEq)]
 pub struct View {
+    #[serde(default, rename = "app-id")]
+    application_id: String,
+    #[serde(default)]
+    title: String,
     id: u32,
     minimized: bool,
     // maximized: bool,
@@ -245,9 +256,9 @@ pub struct Resolution {
     height: f64,
 }
 
-pub fn spawn(registry: BindingRegistry, commands: CommandSender) {
+pub fn spawn(registry: BindingRegistry, commands: CommandSender) -> bool {
     let Some(sock) = detect_socket() else {
-        return;
+        return false;
     };
     log::info!(
         "wayfire_watcher: enabled (socket={})",
@@ -263,6 +274,12 @@ pub fn spawn(registry: BindingRegistry, commands: CommandSender) {
                 EventKind::ViewMinimized,
                 EventKind::ViewMapped,
                 EventKind::ViewUnmapped,
+                EventKind::ViewTitleChanged,
+                EventKind::ViewAppIdChanged,
+                EventKind::ViewTiled,
+                EventKind::ViewSetOutput,
+                EventKind::ViewWorkspaceChanged,
+                EventKind::WorkspaceChanged,
             ];
             event_socket
                 .send_request(&Request {
@@ -276,18 +293,24 @@ pub fn spawn(registry: BindingRegistry, commands: CommandSender) {
                 .receive_response::<CompositorResult>()
                 .map(|resp| {
                     if resp.result != "ok" {
-                        log::error!("wayfire_watcher: compositor result: {}", resp.result)
+                        log::error!("wayfire_watcher: compositor result: {}", resp.result);
+                        false
                     } else {
                         thread::spawn(move || run_loop(event_socket, registry, commands));
+                        true
                     }
                 })
-                .unwrap_or_else(|error| log::error!("wayfire_watcher: read watch: {error}"));
+                .unwrap_or_else(|error| {
+                    log::error!("wayfire_watcher: read watch: {error}");
+                    false
+                })
         })
         .unwrap_or_else(|error| {
             log::error!(
                 "wayfire_watcher: connect {}: {error}",
                 sock.as_ref().display()
-            )
+            );
+            false
         })
 }
 
@@ -312,9 +335,19 @@ fn run_loop(
     registry: BindingRegistry,
     commands: CommandSender,
 ) {
+    let mut initial = true;
     loop {
-        event_socket
-            .receive_event()
+        let ready = if initial {
+            initial = false;
+            Ok(())
+        } else {
+            event_socket.receive_event().map(|_| ())
+        };
+        if let Err(error) = ready {
+            log::error!("wayfire_watcher: receive event: {error}");
+            break;
+        }
+        ready
             .map(|_| {
                 get_views(&mut event_socket)
                     .map(|views| {
@@ -322,19 +355,19 @@ fn run_loop(
                             .lock()
                             .map(|registry| {
                                 let mut output_cache: HashMap<u32, Output> = HashMap::new();
-                                let mut display_flags: HashMap<&String, (u32, &Arc<OutputInfo>)> =
-                                    registry
-                                        .iter()
-                                        .map(|(display_name, output)| (display_name, (0, output)))
-                                        .collect();
+                                let mut display_flags: HashMap<
+                                    String,
+                                    Vec<crate::watcher::Window>,
+                                > = registry
+                                    .keys()
+                                    .map(|display_name| (display_name.clone(), Vec::new()))
+                                    .collect();
                                 for view in views {
+                                    let windows =
+                                        display_flags.entry(view.output_name.clone()).or_default();
                                     if view.minimized || !view.toplevel || !view.mapped {
                                         continue;
                                     }
-                                    let Some((flags, _)) = display_flags.get_mut(&view.output_name)
-                                    else {
-                                        continue;
-                                    };
                                     let entry = output_cache.entry(view.output_id);
                                     let output = if let Entry::Occupied(entry) = entry {
                                         *entry.get()
@@ -358,24 +391,27 @@ fn run_loop(
                                     if !colliding {
                                         continue;
                                     }
-                                    *flags |= WAYWALLEN_WIN_HAS_NON_MINIMIZED;
+                                    let mut flags = WAYWALLEN_WIN_HAS_NON_MINIMIZED;
                                     if view.activated {
-                                        *flags |= WAYWALLEN_WIN_HAS_ACTIVE
+                                        flags |= WAYWALLEN_WIN_HAS_ACTIVE
                                     }
                                     if view.tiled_edges == ALL_CORNERS_TILED {
-                                        *flags |= WAYWALLEN_WIN_HAS_MAXIMIZED
+                                        flags |= WAYWALLEN_WIN_HAS_MAXIMIZED
                                     }
                                     if view.fullscreen {
-                                        *flags |= WAYWALLEN_WIN_HAS_FULLSCREEN
+                                        flags |= WAYWALLEN_WIN_HAS_FULLSCREEN
                                     }
+                                    windows.push(crate::watcher::Window {
+                                        application_id: view.application_id,
+                                        title: view.title,
+                                        flags,
+                                    });
                                 }
-                                for (flags, output) in display_flags.values() {
-                                    if output.replace_window_flags(*flags) {
-                                        commands.send(Command::WindowState {
-                                            display_name: output.display_name().to_string(),
-                                            flags: *flags,
-                                        });
-                                    }
+                                for (display_name, windows) in display_flags {
+                                    commands.send(Command::WindowState {
+                                        display_name,
+                                        windows,
+                                    });
                                 }
                             })
                             .unwrap_or_else(|error| {
@@ -453,6 +489,8 @@ pub fn test_deserialize_response() {
         Event {
             event: EventKind::ViewFocused,
             view: Some(View {
+                application_id: "wcm".to_string(),
+                title: "Wayfire Config Manager".to_string(),
                 id: 11,
                 minimized: false,
                 fullscreen: false,

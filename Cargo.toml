@@ -32,6 +32,7 @@ layer-shell = [
     "dep:wayland-backend",
     "dep:niri-ipc",
     "dep:md-5",
+    "dep:wildmatch",
 ]
 
 [dependencies]
@@ -51,6 +52,7 @@ wayland-scanner = { version = "0.31", optional = true }
 wayland-backend = { version = "0.3", default-features = false, optional = true }
 niri-ipc = { version = "26.4.0", optional = true }
 md-5 = { version = "0.10", optional = true }
+wildmatch = { version = "2.6.1", optional = true }
 
 [build-dependencies]
 cc = "1"

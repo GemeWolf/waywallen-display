@@ -111,13 +111,14 @@ typedef struct ww_bound_pool_state {
  * Numerically aligned with the public enum so the accessor is a cast. */
 typedef enum ww_handshake_state
 {
-    WW_HS_IDLE          = 0,
-    WW_HS_CONNECTING    = 1,
-    WW_HS_HELLO_PENDING = 2,
-    WW_HS_WELCOME_WAIT  = 3,
-    WW_HS_REGISTER_PEND = 4,
-    WW_HS_ACCEPTED_WAIT = 5,
-    WW_HS_READY         = 6,
+    WW_HS_IDLE              = 0,
+    WW_HS_CONNECTING        = 1,
+    WW_HS_HELLO_PENDING     = 2,
+    WW_HS_WELCOME_WAIT      = 3,
+    WW_HS_REGISTER_PEND     = 4,
+    WW_HS_ACCEPTED_WAIT     = 5,
+    WW_HS_READY             = 6,
+    WW_HS_CAPABILITIES_PEND = 7,
 } ww_handshake_state_t;
 
 /* The current wire frame uses the same partial-send buffer as the
@@ -201,10 +202,15 @@ struct waywallen_display {
     /* Stable per-(DE,screen) identifier used by the daemon as the key
      * into per-display settings. Empty string means "no stable id";
      * the daemon then falls back to keying by `hs_display_name`. */
-    char                        hs_instance_id[128];
-    waywallen_display_metrics_t hs_metrics;
-    uint32_t                    window_state_flags;
-    bool                        window_state_dirty_after_register;
+    char                                    hs_instance_id[128];
+    waywallen_display_metrics_t             hs_metrics;
+    uint32_t                                window_state_flags;
+    uint32_t                                window_observation_caps;
+    waywallen_window_observation_callback_t window_observation_callback;
+    void*                                   window_observation_data;
+    waywallen_window_observation_config_t   window_observation_config;
+    bool                                    has_window_observation_config;
+    bool                                    window_state_dirty_after_register;
     /* DRM render-node id of the GPU this display will sample dmabufs on.
      * Populated by waywallen_display_bind_egl/bind_vulkan via the
      * backend's introspection helpers (`ww_egl_query_drm_render_node` /
@@ -215,7 +221,10 @@ struct waywallen_display {
      * explicitly via `waywallen_display_set_drm_render_node`. */
     uint32_t hs_drm_render_major;
     uint32_t hs_drm_render_minor;
-    uint32_t presentation_caps;
+    uint32_t pause_effect_caps;
+    uint32_t transition_caps;
+    bool     has_pause_effect_caps;
+    bool     has_transition_caps;
 
     /* Presentation state is connection-local and independent of the
      * buffer/layout generations below. */
@@ -338,23 +347,17 @@ static int resolve_frame_without_gpu(waywallen_display_t* d, int release_syncobj
                                      uint64_t buffer_generation, uint64_t seq, const char* context);
 
 static bool transition_config_valid(const waywallen_transition_config_t* transition,
-                                    uint32_t                             presentation_caps) {
+                                    uint32_t                             transition_caps) {
     uint32_t required_cap = 0;
     switch (transition->kind) {
     case WAYWALLEN_TRANSITION_KIND_NONE: break;
-    case WAYWALLEN_TRANSITION_KIND_FADE:
-        required_cap = WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION;
-        break;
-    case WAYWALLEN_TRANSITION_KIND_WIPE:
-        required_cap = WAYWALLEN_PRESENTATION_CAP_WIPE_TRANSITION;
-        break;
-    case WAYWALLEN_TRANSITION_KIND_GROW:
-        required_cap = WAYWALLEN_PRESENTATION_CAP_GROW_TRANSITION;
-        break;
+    case WAYWALLEN_TRANSITION_KIND_FADE: required_cap = WAYWALLEN_TRANSITION_CAP_FADE; break;
+    case WAYWALLEN_TRANSITION_KIND_WIPE: required_cap = WAYWALLEN_TRANSITION_CAP_WIPE; break;
+    case WAYWALLEN_TRANSITION_KIND_GROW: required_cap = WAYWALLEN_TRANSITION_CAP_GROW; break;
     default: return false;
     }
     /* The daemon only names kinds this host declared. */
-    if (required_cap != 0 && (presentation_caps & required_cap) == 0) return false;
+    if (required_cap != 0 && (transition_caps & required_cap) == 0) return false;
     if (transition->duration_ms < WW_PRESENTATION_TRANSITION_DURATION_MIN ||
         transition->duration_ms > WW_PRESENTATION_TRANSITION_DURATION_MAX) {
         return false;
@@ -366,7 +369,7 @@ static bool transition_config_valid(const waywallen_transition_config_t* transit
 }
 
 static bool presentation_snapshot_valid(const waywallen_presentation_snapshot_t* presentation,
-                                        uint32_t presentation_caps) {
+                                        uint32_t pause_effect_caps, uint32_t transition_caps) {
     if (! presentation) return false;
     if (presentation->config.generation == 0 || presentation->state.generation == 0) {
         return false;
@@ -379,11 +382,14 @@ static bool presentation_snapshot_valid(const waywallen_presentation_snapshot_t*
         effect->kind != WAYWALLEN_PAUSE_EFFECT_KIND_BLUR) {
         return false;
     }
+    if (effect->kind == WAYWALLEN_PAUSE_EFFECT_KIND_BLUR &&
+        ! (pause_effect_caps & WAYWALLEN_PAUSE_EFFECT_CAP_BLUR))
+        return false;
     if (effect->blur.radius < WW_PRESENTATION_BLUR_RADIUS_MIN ||
         effect->blur.radius > WW_PRESENTATION_BLUR_RADIUS_MAX) {
         return false;
     }
-    if (! transition_config_valid(&presentation->config.transition, presentation_caps)) {
+    if (! transition_config_valid(&presentation->config.transition, transition_caps)) {
         return false;
     }
     return effect->kind == WAYWALLEN_PAUSE_EFFECT_KIND_BLUR ||
@@ -404,7 +410,9 @@ static void fire_disconnected_r(waywallen_display_t* d, waywallen_disconnect_rea
     d->presentation_reset_pending = d->has_presentation;
     d->presentation               = presentation_reset_snapshot();
     d->has_presentation           = false;
-    d->last_reason                = reason;
+    waywallen_window_observation_config_free(&d->window_observation_config);
+    d->has_window_observation_config = false;
+    d->last_reason                   = reason;
     if (msg) {
         size_t n = sizeof(d->last_message) - 1;
         strncpy(d->last_message, msg, n);
@@ -683,6 +691,9 @@ static int enc_hello(const void* m, ww_buf_t* out) {
 }
 static int enc_register(const void* m, ww_buf_t* out) {
     return ww_req_register_display_encode((const ww_req_register_display_t*)m, out);
+}
+static int enc_client_capabilities(const void* m, ww_buf_t* out) {
+    return ww_req_client_capabilities_encode((const ww_req_client_capabilities_t*)m, out);
 }
 static int enc_set_metrics(const void* m, ww_buf_t* out) {
     return ww_req_set_display_metrics_encode((const ww_req_set_display_metrics_t*)m, out);
@@ -1043,6 +1054,7 @@ void waywallen_display_free(waywallen_display_t* d) {
     ww_codec_recv_state_reset(&d->hs_recv);
     outbox_reset_queue(d);
     free(d->out_buf);
+    waywallen_window_observation_config_free(&d->window_observation_config);
     free(d);
 }
 
@@ -1377,7 +1389,30 @@ int waywallen_display_set_presentation_caps(waywallen_display_t* d, uint32_t fla
     if (! d) return WAYWALLEN_ERR_INVAL;
     if (d->conn != WW_CONN_DISCONNECTED) return WAYWALLEN_ERR_STATE;
     if (flags & ~WW_PRESENTATION_CAPS_KNOWN) return WAYWALLEN_ERR_INVAL;
-    d->presentation_caps = flags;
+    d->pause_effect_caps     = flags & 1u;
+    d->transition_caps       = (flags >> 1) & 7u;
+    d->has_pause_effect_caps = false;
+    d->has_transition_caps   = false;
+    return WAYWALLEN_OK;
+}
+
+int waywallen_display_set_pause_effect_caps(waywallen_display_t* d, uint32_t flags) {
+    if (! d) return WAYWALLEN_ERR_INVAL;
+    if (d->conn != WW_CONN_DISCONNECTED) return WAYWALLEN_ERR_STATE;
+    if (flags & ~WAYWALLEN_PAUSE_EFFECT_CAP_BLUR) return WAYWALLEN_ERR_INVAL;
+    d->pause_effect_caps     = flags;
+    d->has_pause_effect_caps = true;
+    return WAYWALLEN_OK;
+}
+
+int waywallen_display_set_transition_caps(waywallen_display_t* d, uint32_t flags) {
+    if (! d) return WAYWALLEN_ERR_INVAL;
+    if (d->conn != WW_CONN_DISCONNECTED) return WAYWALLEN_ERR_STATE;
+    if (flags & ~(WAYWALLEN_TRANSITION_CAP_FADE | WAYWALLEN_TRANSITION_CAP_WIPE |
+                  WAYWALLEN_TRANSITION_CAP_GROW))
+        return WAYWALLEN_ERR_INVAL;
+    d->transition_caps     = flags;
+    d->has_transition_caps = true;
     return WAYWALLEN_OK;
 }
 
@@ -1462,7 +1497,8 @@ static int hs_queue_register(waywallen_display_t* d) {
     reg.instance_id             = d->hs_instance_id;
     reg.metrics                 = d->hs_metrics;
     reg.consumer_caps           = caps.caps;
-    reg.presentation_caps.flags = d->presentation_caps;
+    reg.presentation_caps.flags = (d->has_pause_effect_caps ? 0 : d->pause_effect_caps) |
+                                  (d->has_transition_caps ? 0 : d->transition_caps << 1);
     reg.window_state_flags      = d->window_state_flags;
     int rc                      = hs_queue_request(d, WW_REQ_REGISTER_DISPLAY, enc_register, &reg);
     consumer_caps_storage_free(&caps);
@@ -1578,6 +1614,7 @@ static int hs_advance_one(waywallen_display_t* d) {
     }
 
     case WW_HS_HELLO_PENDING:
+    case WW_HS_CAPABILITIES_PEND:
     case WW_HS_REGISTER_PEND: {
         ssize_t n = ww_codec_send_partial(d->fd, d->out_buf + d->out_pos, d->out_len - d->out_pos);
         if (n < 0) {
@@ -1587,6 +1624,15 @@ static int hs_advance_one(waywallen_display_t* d) {
         if (n == 0) return WAYWALLEN_HS_NEED_WRITE;
         d->out_pos += (size_t)n;
         if (d->out_pos < d->out_len) return WAYWALLEN_HS_NEED_WRITE;
+        if (d->hs_state == WW_HS_CAPABILITIES_PEND) {
+            int rc = hs_queue_register(d);
+            if (rc != WAYWALLEN_OK) {
+                fire_disconnected(d, rc, "queue register_display");
+                return rc;
+            }
+            d->hs_state = WW_HS_REGISTER_PEND;
+            return WAYWALLEN_HS_PROGRESS;
+        }
         if (d->hs_state == WW_HS_HELLO_PENDING) {
             d->hs_state = WW_HS_WELCOME_WAIT;
         } else {
@@ -1647,6 +1693,24 @@ static int hs_advance_one(waywallen_display_t* d) {
         }
         ww_evt_welcome_free(&welcome);
         ww_codec_recv_state_reset(&d->hs_recv);
+        if (d->window_observation_callback || d->has_pause_effect_caps || d->has_transition_caps) {
+            ww_req_client_capabilities_t caps = {
+                .has_window_observation = d->window_observation_callback != NULL,
+                .window_observation     = { .flags = d->window_observation_caps },
+                .has_pause_effect       = d->has_pause_effect_caps,
+                .pause_effect           = { .flags = d->pause_effect_caps },
+                .has_transition         = d->has_transition_caps,
+                .transition             = { .flags = d->transition_caps }
+            };
+            int rc2 =
+                hs_queue_request(d, WW_REQ_CLIENT_CAPABILITIES, enc_client_capabilities, &caps);
+            if (rc2 != WAYWALLEN_OK) {
+                fire_disconnected(d, rc2, "queue client_capabilities");
+                return rc2;
+            }
+            d->hs_state = WW_HS_CAPABILITIES_PEND;
+            return WAYWALLEN_HS_PROGRESS;
+        }
         int rc2 = hs_queue_register(d);
         if (rc2 != WAYWALLEN_OK) {
             fire_disconnected(d, rc2, "queue register_display");
@@ -1701,7 +1765,8 @@ static int hs_advance_one(waywallen_display_t* d) {
             return WAYWALLEN_ERR_PROTO;
         }
         d->display_id = accepted.display_id;
-        if (! presentation_snapshot_valid(&accepted.presentation, d->presentation_caps)) {
+        if (! presentation_snapshot_valid(
+                &accepted.presentation, d->pause_effect_caps, d->transition_caps)) {
             ww_evt_display_accepted_free(&accepted);
             fire_disconnected_r(d,
                                 WAYWALLEN_DISCONNECT_HANDSHAKE_FAILED,
@@ -1795,6 +1860,46 @@ static int enc_window_state(const void* m, ww_buf_t* out) {
     return ww_req_set_window_state_encode((const ww_req_set_window_state_t*)m, out);
 }
 
+static int enc_observation_state(const void* m, ww_buf_t* out) {
+    return ww_req_set_window_observation_state_encode(
+        (const ww_req_set_window_observation_state_t*)m, out);
+}
+
+int waywallen_display_set_window_observation_callback(
+    waywallen_display_t* d, uint32_t caps, waywallen_window_observation_callback_t callback,
+    void* user_data) {
+    if (! d || (caps & ~15u)) return WAYWALLEN_ERR_INVAL;
+    if (((caps & WAYWALLEN_WINDOW_OBSERVATION_APPLICATION_ID_PATTERN) &&
+         ! (caps & WAYWALLEN_WINDOW_OBSERVATION_APPLICATION_ID)) ||
+        ((caps & WAYWALLEN_WINDOW_OBSERVATION_TITLE_PATTERN) &&
+         ! (caps & WAYWALLEN_WINDOW_OBSERVATION_TITLE)))
+        return WAYWALLEN_ERR_INVAL;
+    if (d->conn != WW_CONN_DISCONNECTED && d->conn != WW_CONN_DEAD) return WAYWALLEN_ERR_STATE;
+    d->window_observation_caps     = caps;
+    d->window_observation_callback = callback;
+    d->window_observation_data     = user_data;
+    return WAYWALLEN_OK;
+}
+
+const waywallen_window_observation_config_t*
+waywallen_display_get_window_observation_config(const waywallen_display_t* d) {
+    return d && d->has_window_observation_config ? &d->window_observation_config : NULL;
+}
+
+int waywallen_display_set_window_observation_state(waywallen_display_t* d, uint64_t generation,
+                                                   uint32_t flags) {
+    if (! d || (flags & ~WAYWALLEN_WIN_STATE_MASK)) return WAYWALLEN_ERR_INVAL;
+    if (d->conn != WW_CONN_CONNECTED || ! d->has_window_observation_config ||
+        generation != d->window_observation_config.generation)
+        return WAYWALLEN_ERR_STATE;
+    ww_req_set_window_observation_state_t msg = { .config_generation = generation, .flags = flags };
+    return outbox_enqueue_request(d,
+                                  WW_OUTBOX_REPLACE_WINDOW,
+                                  WW_REQ_SET_WINDOW_OBSERVATION_STATE,
+                                  enc_observation_state,
+                                  &msg);
+}
+
 static int enc_frame_release_armed(const void* m, ww_buf_t* out) {
     return ww_req_frame_release_armed_encode((const ww_req_frame_release_armed_t*)m, out);
 }
@@ -1813,6 +1918,7 @@ int waywallen_display_frame_release_armed(waywallen_display_t* d, uint64_t buffe
 
 int waywallen_display_set_window_state(waywallen_display_t* d, uint32_t flags) {
     if (! d) return WAYWALLEN_ERR_INVAL;
+    if (d->has_window_observation_config) return WAYWALLEN_ERR_STATE;
     if (flags & ~WAYWALLEN_WIN_STATE_MASK) return WAYWALLEN_ERR_INVAL;
     d->window_state_flags = flags;
     if (d->conn == WW_CONN_DISCONNECTED || d->conn == WW_CONN_DEAD) return WAYWALLEN_OK;
@@ -2630,7 +2736,8 @@ static int handle_set_presentation_snapshot(waywallen_display_t* d, const uint8_
         return WAYWALLEN_ERR_PROTO;
     }
     bool valid = d->has_presentation &&
-                 presentation_snapshot_valid(&event.presentation, d->presentation_caps) &&
+                 presentation_snapshot_valid(
+                     &event.presentation, d->pause_effect_caps, d->transition_caps) &&
                  event.presentation.config.generation > d->presentation.config.generation &&
                  event.presentation.state.generation > d->presentation.state.generation;
     if (! valid) {
@@ -2920,6 +3027,49 @@ int waywallen_display_dispatch(waywallen_display_t* d) {
     int      ret;
 
     switch (op) {
+    case WW_EVT_SET_WINDOW_OBSERVATION_CONFIG: {
+        ww_evt_set_window_observation_config_t event;
+        bool                                   valid = d->window_observation_callback && n_fds == 0;
+        close_all_fds(fd_buf, n_fds);
+        if (! valid ||
+            ww_evt_set_window_observation_config_decode(body_buf, body_len, &event) != WW_OK) {
+            ret = WAYWALLEN_ERR_PROTO;
+            break;
+        }
+        bool bounded =
+            event.config.excluded_application_ids.count +
+                    event.config.excluded_application_id_patterns.count <=
+                64 &&
+            event.config.excluded_titles.count + event.config.excluded_title_patterns.count <= 64;
+        const ww_array_string_t* lists[] = { &event.config.excluded_application_ids,
+                                             &event.config.excluded_titles,
+                                             &event.config.excluded_application_id_patterns,
+                                             &event.config.excluded_title_patterns };
+        for (size_t list = 0; bounded && list < 4; ++list) {
+            for (uint32_t i = 0; i < lists[list]->count; ++i) {
+                if (strlen(lists[list]->data[i]) > 256) bounded = false;
+            }
+        }
+        if (! bounded ||
+            (lists[2]->count && ! (d->window_observation_caps &
+                                   WAYWALLEN_WINDOW_OBSERVATION_APPLICATION_ID_PATTERN)) ||
+            (lists[3]->count &&
+             ! (d->window_observation_caps & WAYWALLEN_WINDOW_OBSERVATION_TITLE_PATTERN)) ||
+            (event.config.generation == 0 &&
+             (lists[0]->count || lists[1]->count || lists[2]->count || lists[3]->count)) ||
+            (d->has_window_observation_config &&
+             event.config.generation <= d->window_observation_config.generation)) {
+            ww_evt_set_window_observation_config_free(&event);
+            ret = WAYWALLEN_ERR_PROTO;
+            break;
+        }
+        waywallen_window_observation_config_free(&d->window_observation_config);
+        d->window_observation_config     = event.config;
+        d->has_window_observation_config = true;
+        d->window_observation_callback(d->window_observation_data, &d->window_observation_config);
+        ret = WAYWALLEN_OK;
+        break;
+    }
     case WW_EVT_BIND_BUFFERS:
         ret = handle_bind_buffers(d, body_buf, body_len, fd_buf, n_fds);
         break;
@@ -2965,6 +3115,8 @@ int waywallen_display_dispatch(waywallen_display_t* d) {
      * Reset must precede flush_dead_event, which may free d. */
     d->hs_recv.n_fds = 0;
     ww_codec_recv_state_reset(&d->hs_recv);
+    if (op == WW_EVT_SET_WINDOW_OBSERVATION_CONFIG && ret < 0)
+        fire_disconnected(d, ret, "invalid window observation config");
     flush_dead_event(d); /* must be last; may free d */
     return ret;
 }
@@ -3133,6 +3285,8 @@ done:
 
 void waywallen_display_close(waywallen_display_t* d) {
     if (! d) return;
+    waywallen_window_observation_config_free(&d->window_observation_config);
+    d->has_window_observation_config = false;
     if (d->fd >= 0) {
         close(d->fd);
         d->fd = -1;

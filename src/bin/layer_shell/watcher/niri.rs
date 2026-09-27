@@ -1,7 +1,7 @@
 use crate::watcher::{BindingRegistry, Command, CommandSender, OutputInfo};
 use niri_ipc::socket::Socket;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart, WindowsState, WorkspacesState};
-use niri_ipc::{Event, Request, Response, Window};
+use niri_ipc::{Request, Response, Window};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -29,9 +29,9 @@ pub fn detect_socket() -> Option<impl AsRef<Path>> {
     }
 }
 
-pub fn spawn(registry: BindingRegistry, commands: CommandSender) {
+pub fn spawn(registry: BindingRegistry, commands: CommandSender) -> bool {
     let Some(sock) = detect_socket() else {
-        return;
+        return false;
     };
     log::info!("niri_watcher: enabled (socket={})", sock.as_ref().display());
     Socket::connect_to(sock.as_ref())
@@ -42,17 +42,26 @@ pub fn spawn(registry: BindingRegistry, commands: CommandSender) {
                     Ok(response) => match response {
                         Response::Handled => {
                             thread::spawn(move || run_loop(event_socket, registry, commands));
+                            true
                         }
                         response => {
-                            log::error!("niri_watcher: {}", Error::UnexpectedResponse(response))
+                            log::error!("niri_watcher: {}", Error::UnexpectedResponse(response));
+                            false
                         }
                     },
-                    Err(error) => log::error!("niri_watcher: {}", Error::CompositorResponse(error)),
+                    Err(error) => {
+                        log::error!("niri_watcher: {}", Error::CompositorResponse(error));
+                        false
+                    }
                 })
-                .unwrap_or_else(|error| log::error!("niri_watcher: request eventstream: {error}"))
+                .unwrap_or_else(|error| {
+                    log::error!("niri_watcher: request eventstream: {error}");
+                    false
+                })
         })
         .unwrap_or_else(|error| {
-            log::error!("niri_watcher: connect {}: {error}", sock.as_ref().display())
+            log::error!("niri_watcher: connect {}: {error}", sock.as_ref().display());
+            false
         })
 }
 
@@ -60,43 +69,30 @@ fn run_loop(event_socket: Socket, registry: BindingRegistry, commands: CommandSe
     let mut state = EventStreamState::default();
     let mut read_event = event_socket.read_events();
     loop {
-        read_event()
-            .map(|event| {
-                log::debug!("niri_watcher: niri event: {:?}", event);
-                if matches!(
-                    event,
-                    Event::WindowLayoutsChanged { .. }
-                        | Event::WindowOpenedOrChanged { .. }
-                        | Event::WindowFocusChanged { .. }
-                        | Event::WorkspaceActivated { .. }
-                ) {
-                    state.apply(event);
-                    registry
-                        .lock()
-                        .map(|registry| {
-                            get_outputs_flags(&*registry, &state.workspaces, &state.windows)
-                                .into_iter()
-                                .for_each(|(output, flags)| {
-                                    commands.send(Command::WindowState {
-                                        display_name: output.display_name().to_string(),
-                                        flags,
-                                    });
-                                })
-                        })
-                        .unwrap_or_else(|error| log::error!("niri_watcher: lock registry: {error}"))
-                } else {
-                    state.apply(event);
-                }
-            })
-            .unwrap_or_else(|error| log::error!("niri_watcher: read event: {error}"));
+        let event = match read_event() {
+            Ok(event) => event,
+            Err(error) => {
+                log::error!("niri_watcher: read event: {error}");
+                break;
+            }
+        };
+        state.apply(event);
+        let snapshots =
+            get_outputs_windows(&registry.lock().unwrap(), &state.workspaces, &state.windows);
+        for (display_name, windows) in snapshots {
+            commands.send(Command::WindowState {
+                display_name,
+                windows,
+            });
+        }
     }
 }
 
-fn get_outputs_flags(
+fn get_outputs_windows(
     outputs: &HashMap<String, Arc<OutputInfo>>,
     workspaces_state: &WorkspacesState,
     windows_state: &WindowsState,
-) -> Vec<(Arc<OutputInfo>, u32)> {
+) -> Vec<(String, Vec<crate::watcher::Window>)> {
     let mut changed = Vec::new();
     for workspace in workspaces_state
         .workspaces
@@ -106,33 +102,33 @@ fn get_outputs_flags(
         let Some(output_name) = workspace.output.as_ref() else {
             continue;
         };
-        let Some(output) = outputs.get(output_name) else {
-            continue;
-        };
-        let flags = workspace
-            .active_window_id
-            .and_then(|id| windows_state.windows.get(&id))
-            .and_then(|window| {
-                output
-                    .logical_size()
-                    .map(|(width, height)| window_to_flags((width as i32, height as i32), window))
+        let size = outputs
+            .get(output_name)
+            .and_then(|output| output.logical_size())
+            .map(|(w, h)| (w as i32, h as i32))
+            .unwrap_or((0, 0));
+        let windows = windows_state
+            .windows
+            .values()
+            .filter(|window| window.workspace_id == Some(workspace.id))
+            .map(|window| crate::watcher::Window {
+                application_id: window.app_id.clone().unwrap_or_default(),
+                title: window.title.clone().unwrap_or_default(),
+                flags: window_to_flags(size, window),
             })
-            .unwrap_or(0);
-        log::debug!("niri_watcher: {} flags: {flags}", output.display_name());
-        if output.replace_window_flags(flags) {
-            changed.push((output.clone(), flags));
-        }
+            .collect();
+        changed.push((output_name.clone(), windows));
     }
     changed
 }
 
-// Implementation note: niri can never have an unfocused window - it doesn't support minimization
-// Also, for now, the IPC doesn't report fullscreen / maximize state, so we have to guess for
-// fullscreen and just do without maximization.
+// The IPC does not report fullscreen/maximized state; retain the geometry heuristic.
 fn window_to_flags(fullscreen: (i32, i32), window: &Window) -> u32 {
     let mut flags = 0;
     flags |= WAYWALLEN_WIN_HAS_NON_MINIMIZED;
-    flags |= WAYWALLEN_WIN_HAS_ACTIVE;
+    if window.is_focused {
+        flags |= WAYWALLEN_WIN_HAS_ACTIVE;
+    }
     if is_window_fullscreen(fullscreen, window) {
         flags |= WAYWALLEN_WIN_HAS_FULLSCREEN
     } /* else if is_window_maximized(fullscreen, window) {

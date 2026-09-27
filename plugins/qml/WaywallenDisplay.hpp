@@ -1,8 +1,8 @@
 #pragma once
 
-#include <waywallen_display_presentation.h>
-#include <waywallen_display_protocol_types.h>
-#include <waywallen_display_vulkan_presenter.h>
+#include "WindowPattern.hpp"
+
+#include <waywallen_display.h>
 
 #include <QColor>
 #include <QElapsedTimer>
@@ -19,14 +19,6 @@
 #include <cstdint>
 #include <memory>
 
-struct waywallen_display;
-typedef struct waywallen_display waywallen_display_t;
-struct waywallen_textures;
-typedef struct waywallen_textures waywallen_textures_t;
-struct waywallen_binding;
-typedef struct waywallen_binding waywallen_binding_t;
-struct waywallen_frame;
-typedef struct waywallen_frame waywallen_frame_t;
 class RenderSessionResources;
 class QScreen;
 
@@ -63,8 +55,20 @@ class WaywallenDisplay : public QQuickItem {
     // `window_state` request; the daemon owns the autopause policy.
     Q_PROPERTY(quint32 windowStateFlags READ windowStateFlags WRITE setWindowStateFlags NOTIFY
                    windowStateFlagsChanged)
+    Q_PROPERTY(quint32 windowObservationCapabilities MEMBER m_windowObservationCapabilities)
+    Q_PROPERTY(QStringList excludedApplicationIds READ excludedApplicationIds NOTIFY
+                   windowObservationChanged)
+    Q_PROPERTY(
+        QStringList excludedWindowTitles READ excludedWindowTitles NOTIFY windowObservationChanged)
+    Q_PROPERTY(qulonglong windowObservationGeneration READ windowObservationGeneration NOTIFY
+                   windowObservationChanged)
+    // Deprecated compatibility property; new clients use the independent groups.
     Q_PROPERTY(quint32 presentationCapabilities READ presentationCapabilities WRITE
                    setPresentationCapabilities NOTIFY presentationCapabilitiesChanged)
+    Q_PROPERTY(quint32 pauseEffectCapabilities READ pauseEffectCapabilities WRITE
+                   setPauseEffectCapabilities NOTIFY pauseEffectCapabilitiesChanged)
+    Q_PROPERTY(quint32 transitionCapabilities READ transitionCapabilities WRITE
+                   setTransitionCapabilities NOTIFY transitionCapabilitiesChanged)
     Q_PROPERTY(PauseEffectKind pauseEffectKind READ pauseEffectKind NOTIFY presentationChanged)
     Q_PROPERTY(int blurRadius READ blurRadius NOTIFY presentationChanged)
     Q_PROPERTY(bool pauseEffectActive READ pauseEffectActive NOTIFY presentationChanged)
@@ -74,6 +78,10 @@ class WaywallenDisplay : public QQuickItem {
                    presentationChanged)
 
 public:
+    Q_INVOKABLE bool   excludesWindow(const QString& applicationId, const QString& title) const;
+    const QStringList& excludedApplicationIds() const { return m_excludedApplicationIds; }
+    const QStringList& excludedWindowTitles() const { return m_excludedWindowTitles; }
+    qulonglong         windowObservationGeneration() const { return m_windowObservationGeneration; }
     enum ConnState
     {
         Disconnected = 0,
@@ -113,6 +121,21 @@ public:
     };
     Q_ENUM(DisconnectReason)
 
+    enum PauseEffectCapability
+    {
+        PauseEffectBlurCapability = WAYWALLEN_PAUSE_EFFECT_CAP_BLUR,
+    };
+    Q_ENUM(PauseEffectCapability)
+
+    enum TransitionCapability
+    {
+        TransitionFadeCapability = WAYWALLEN_TRANSITION_CAP_FADE,
+        TransitionWipeCapability = WAYWALLEN_TRANSITION_CAP_WIPE,
+        TransitionGrowCapability = WAYWALLEN_TRANSITION_CAP_GROW,
+    };
+    Q_ENUM(TransitionCapability)
+
+    // Deprecated legacy bit layout.
     enum PresentationCapability
     {
         PauseBlurCapability      = 1u << 0,
@@ -173,8 +196,14 @@ public:
     quint32 windowStateFlags() const { return m_windowStateFlags; }
     void    setWindowStateFlags(quint32 flags);
 
-    quint32 presentationCapabilities() const { return m_presentationCapabilities; }
+    quint32 presentationCapabilities() const {
+        return m_pauseEffectCapabilities | (m_transitionCapabilities << 1);
+    }
     void    setPresentationCapabilities(quint32 capabilities);
+    quint32 pauseEffectCapabilities() const { return m_pauseEffectCapabilities; }
+    void    setPauseEffectCapabilities(quint32 capabilities);
+    quint32 transitionCapabilities() const { return m_transitionCapabilities; }
+    void    setTransitionCapabilities(quint32 capabilities);
 
     PauseEffectKind pauseEffectKind() const { return m_pauseEffectKind; }
     int             blurRadius() const { return m_blurRadius; }
@@ -207,7 +236,10 @@ signals:
     void autoReconnectChanged();
     void mouseForwardEnabledChanged();
     void windowStateFlagsChanged();
+    void windowObservationChanged();
     void presentationCapabilitiesChanged();
+    void pauseEffectCapabilitiesChanged();
+    void transitionCapabilitiesChanged();
     void presentationChanged();
 
 protected:
@@ -316,18 +348,25 @@ private:
     // connection is up; held until then so the post-handshake state
     // matches whatever the WindowModel last computed (replayed from
     // setConnState(Connected)).
-    quint32         m_windowStateFlags { 0 };
-    bool            m_windowStateFlagsDirty { false };
-    quint32         m_presentationCapabilities { 0 };
-    PauseEffectKind m_pauseEffectKind { NonePauseEffect };
-    int             m_blurRadius { 30 };
-    bool            m_pauseEffectActive { false };
-    qulonglong      m_presentationConfigGeneration { 0 };
-    qulonglong      m_presentationStateGeneration { 0 };
-    TransitionKind  m_transitionKind { NoTransition };
-    int             m_transitionDurationMs { 400 };
-    quint32         m_transitionAngle { 0 };
-    QPointF         m_transitionOrigin { 0.5, 0.5 };
+    quint32                m_windowStateFlags { 0 };
+    quint32                m_windowObservationCapabilities { 0 };
+    qulonglong             m_windowObservationGeneration { 0 };
+    QStringList            m_excludedApplicationIds;
+    QStringList            m_excludedWindowTitles;
+    QVector<WindowPattern> m_excludedApplicationPatterns;
+    QVector<WindowPattern> m_excludedTitlePatterns;
+    bool                   m_windowStateFlagsDirty { false };
+    quint32                m_pauseEffectCapabilities { 0 };
+    quint32                m_transitionCapabilities { 0 };
+    PauseEffectKind        m_pauseEffectKind { NonePauseEffect };
+    int                    m_blurRadius { 30 };
+    bool                   m_pauseEffectActive { false };
+    qulonglong             m_presentationConfigGeneration { 0 };
+    qulonglong             m_presentationStateGeneration { 0 };
+    TransitionKind         m_transitionKind { NoTransition };
+    int                    m_transitionDurationMs { 400 };
+    quint32                m_transitionAngle { 0 };
+    QPointF                m_transitionOrigin { 0.5, 0.5 };
 
     mutable QMutex                          m_resourcesMutex;
     std::shared_ptr<RenderSessionResources> m_renderResources;

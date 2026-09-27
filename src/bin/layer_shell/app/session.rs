@@ -14,6 +14,51 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use waywallen_display as sys;
 
+pub(super) fn publish_window_state(
+    binding: &OutputBinding,
+    display: *mut sys::waywallen_display_t,
+) -> i32 {
+    let (generation, flags) = binding.watcher.window_state();
+    unsafe {
+        match generation {
+            Some(generation) => {
+                sys::waywallen_display_set_window_observation_state(display, generation, flags)
+            }
+            None => sys::waywallen_display_set_window_state(display, flags),
+        }
+    }
+}
+
+unsafe extern "C" fn on_window_observation_config(
+    user_data: *mut c_void,
+    config: *const sys::waywallen_window_observation_config_t,
+) {
+    let binding = &*(user_data as *const OutputBinding);
+    let config = &*config;
+    binding
+        .watcher
+        .configure(Some(crate::watcher::WindowExclusions {
+            generation: config.generation,
+            application_ids: config.excluded_application_ids.to_vec(),
+            titles: config.excluded_titles.to_vec(),
+            application_id_patterns: config
+                .excluded_application_id_patterns
+                .to_vec()
+                .iter()
+                .map(|pattern| wildmatch::WildMatch::new(pattern))
+                .collect(),
+            title_patterns: config
+                .excluded_title_patterns
+                .to_vec()
+                .iter()
+                .map(|pattern| wildmatch::WildMatch::new(pattern))
+                .collect(),
+        }));
+    if let Some(display) = *binding.display.lock().unwrap() {
+        publish_window_state(binding, display.0);
+    }
+}
+
 impl App {
     pub(super) fn start_due_sessions(&mut self) {
         let now = Instant::now();
@@ -34,7 +79,8 @@ impl App {
             else {
                 continue;
             };
-            match start_display_session(&self.uds_sock, &binding) {
+            match start_display_session(&self.uds_sock, &binding, self.window_observation_available)
+            {
                 Ok(session) => {
                     if let Some(entry) = self.outputs.get_mut(&output_name) {
                         entry.session = Some(session);
@@ -213,7 +259,11 @@ impl App {
     }
 }
 
-fn start_display_session(sock: &Path, binding: &Rc<OutputBinding>) -> Result<DisplaySession> {
+fn start_display_session(
+    sock: &Path,
+    binding: &Rc<OutputBinding>,
+    observation_available: bool,
+) -> Result<DisplaySession> {
     let (width, height) = binding
         .configured_size
         .lock()
@@ -247,23 +297,44 @@ fn start_display_session(sock: &Path, binding: &Rc<OutputBinding>) -> Result<Dis
         if rc < 0 {
             bail!("waywallen_display_bind_vulkan failed: {rc}");
         }
-        let presentation_caps = {
+        let (pause_effect_caps, transition_caps) = {
             let presenter = binding.presenter.lock().unwrap();
-            let mut caps = 0;
-            if presenter.supports_pause_blur() {
-                caps |= sys::WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR;
-            }
-            if presenter.supports_transitions() {
-                caps |= sys::WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION
-                    | sys::WAYWALLEN_PRESENTATION_CAP_WIPE_TRANSITION
-                    | sys::WAYWALLEN_PRESENTATION_CAP_GROW_TRANSITION;
-            }
-            caps
+            let pause_effect = if presenter.supports_pause_blur() {
+                sys::WAYWALLEN_PAUSE_EFFECT_CAP_BLUR
+            } else {
+                0
+            };
+            let transition = if presenter.supports_transitions() {
+                sys::WAYWALLEN_TRANSITION_CAP_FADE
+                    | sys::WAYWALLEN_TRANSITION_CAP_WIPE
+                    | sys::WAYWALLEN_TRANSITION_CAP_GROW
+            } else {
+                0
+            };
+            (pause_effect, transition)
         };
         let rc =
-            unsafe { sys::waywallen_display_set_presentation_caps(display, presentation_caps) };
+            unsafe { sys::waywallen_display_set_pause_effect_caps(display, pause_effect_caps) };
         if rc < 0 {
-            bail!("waywallen_display_set_presentation_caps failed: {rc}");
+            bail!("waywallen_display_set_pause_effect_caps failed: {rc}");
+        }
+        let rc = unsafe { sys::waywallen_display_set_transition_caps(display, transition_caps) };
+        if rc < 0 {
+            bail!("waywallen_display_set_transition_caps failed: {rc}");
+        }
+        binding.watcher.configure(None);
+        if observation_available {
+            let rc = unsafe {
+                sys::waywallen_display_set_window_observation_callback(
+                    display,
+                    15,
+                    Some(on_window_observation_config),
+                    Rc::as_ptr(binding) as *mut c_void,
+                )
+            };
+            if rc < 0 {
+                bail!("waywallen_display_set_window_observation_callback failed: {rc}");
+            }
         }
         let flags = binding.watcher.window_flags();
         let rc = unsafe { sys::waywallen_display_set_window_state(display, flags) };

@@ -32,10 +32,10 @@ Item {
         anchors.fill: parent
         displayWidth: root.width
         displayHeight: root.height
-        presentationCapabilities: WW.WaywallenDisplay.PauseBlurCapability
-                                  | WW.WaywallenDisplay.FadeTransitionCapability
-                                  | WW.WaywallenDisplay.WipeTransitionCapability
-                                  | WW.WaywallenDisplay.GrowTransitionCapability
+        pauseEffectCapabilities: WW.WaywallenDisplay.PauseEffectBlurCapability
+        transitionCapabilities: WW.WaywallenDisplay.TransitionFadeCapability
+                                | WW.WaywallenDisplay.TransitionWipeCapability
+                                | WW.WaywallenDisplay.TransitionGrowCapability
     }
 
     Loader {

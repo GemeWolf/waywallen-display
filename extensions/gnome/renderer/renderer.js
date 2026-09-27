@@ -241,12 +241,13 @@ class MonitorRenderer {
         const d = Waywallen.Display.new();
         if (!d.bind_dmabuf_relay())
             throw new Error('bind_dmabuf_relay failed');
-        const capabilities = Waywallen.PresentationCapability.PAUSE_BLUR |
-            Waywallen.PresentationCapability.FADE |
-            Waywallen.PresentationCapability.WIPE |
-            Waywallen.PresentationCapability.GROW;
-        if (!d.set_presentation_capabilities(capabilities))
-            throw new Error('set_presentation_capabilities failed');
+        if (!d.set_pause_effect_capabilities(Waywallen.PauseEffectCapability.BLUR))
+            throw new Error('set_pause_effect_capabilities failed');
+        const transitions = Waywallen.TransitionCapability.FADE |
+            Waywallen.TransitionCapability.WIPE |
+            Waywallen.TransitionCapability.GROW;
+        if (!d.set_transition_capabilities(transitions))
+            throw new Error('set_transition_capabilities failed');
         this._display = d;
 
         this._presentationWidget.connect('binding-staged',
@@ -280,6 +281,11 @@ class MonitorRenderer {
             (_o, code, msg) => this._onDisconnected(code, msg));
 
         const refreshMhz = this._monitor.get_refresh_rate() || 60000;
+        d.connect('window-observation-rules', (_o, generation, applicationIds, titles, applicationIdPatterns, titlePatterns) => {
+            this._writeControl({type: 'window-observation-config', config: {generation, applicationIds, titles, applicationIdPatterns, titlePatterns}});
+        });
+        if (!d.set_window_observation_capabilities(15))
+            throw new Error('set_window_observation_capabilities failed');
         d.set_window_state(this._winFlags ?? 0);
         if (!d.begin_connect(this._opts.socketPath,
                              this._displayName,
@@ -448,9 +454,10 @@ class MonitorRenderer {
         this._display?.send_pointer_axis(x * s, y * s, dx, dy, ts, 0);
     }
 
-    sendWindowState(flags) {
+    sendWindowState(flags, generation = null) {
         this._winFlags = flags;
-        this._display?.set_window_state(flags);
+        if (generation === null) this._display?.set_window_state(flags);
+        else this._display?.set_window_observation_state(generation, flags);
         if (this._diagLabel)
             this._updateDiag();
     }
@@ -538,7 +545,7 @@ function dispatchInput(line) {
                                   f[4] === '1', parseInt(f[5]) || 0); break;
     case 'A': r.sendPointerAxis(lx, ly, parseFloat(f[3]) || 0,
                                 parseFloat(f[4]) || 0, parseInt(f[5]) || 0); break;
-    case 'W': r.sendWindowState(parseInt(f[3]) || 0); break;
+    case 'W': r.sendWindowState(parseInt(f[3]) || 0, f.length > 4 ? Number(f[4]) : null); break;
     case 'R': r.confirmPresentation(parseInt(f[3]) || 0); break;
     }
 }

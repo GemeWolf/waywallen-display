@@ -52,6 +52,21 @@ typedef enum
 
 typedef enum
 {
+    WW_PAUSE_EFFECT_CAPABILITY_NONE = 0,
+    WW_PAUSE_EFFECT_CAPABILITY_BLUR = 1u << 0,
+} WwPauseEffectCapability;
+
+typedef enum
+{
+    WW_TRANSITION_CAPABILITY_NONE = 0,
+    WW_TRANSITION_CAPABILITY_FADE = 1u << 0,
+    WW_TRANSITION_CAPABILITY_WIPE = 1u << 1,
+    WW_TRANSITION_CAPABILITY_GROW = 1u << 2,
+} WwTransitionCapability;
+
+/* Deprecated legacy bit layout. */
+typedef enum
+{
     WW_PRESENTATION_CAPABILITY_NONE       = 0,
     WW_PRESENTATION_CAPABILITY_PAUSE_BLUR = 1u << 0,
     WW_PRESENTATION_CAPABILITY_FADE       = 1u << 1,
@@ -111,8 +126,30 @@ gboolean ww_display_bind_dmabuf_relay(WwDisplay* self);
  * be called before ww_display_begin_connect().
  *
  * Returns: TRUE on success
+ * Deprecated: Use ww_display_set_pause_effect_capabilities() and
+ * ww_display_set_transition_capabilities().
  */
 gboolean ww_display_set_presentation_capabilities(WwDisplay* self, guint flags);
+
+/**
+ * ww_display_set_pause_effect_capabilities:
+ * @self: a #WwDisplay
+ * @flags: a bitmask of #WwPauseEffectCapability
+ *
+ * Must be called before ww_display_begin_connect().
+ * Returns: TRUE on success
+ */
+gboolean ww_display_set_pause_effect_capabilities(WwDisplay* self, guint flags);
+
+/**
+ * ww_display_set_transition_capabilities:
+ * @self: a #WwDisplay
+ * @flags: a bitmask of #WwTransitionCapability
+ *
+ * Must be called before ww_display_begin_connect().
+ * Returns: TRUE on success
+ */
+gboolean ww_display_set_transition_capabilities(WwDisplay* self, guint flags);
 
 /**
  * ww_display_get_shadow_export:
@@ -261,6 +298,18 @@ void ww_display_send_pointer_axis(WwDisplay* self, gdouble x, gdouble y, gdouble
  * daemon owns all pause policy; the caller must not debounce or filter.
  */
 void ww_display_set_window_state(WwDisplay* self, guint flags);
+
+/**
+ * ww_display_set_window_observation_capabilities:
+ * @self: a #WwDisplay
+ * @capabilities: application ID (1) and title (2) support
+ *
+ * Configure before connecting. Listen to window-observation-config and
+ * report the recomputed state with its generation.
+ * Returns: whether configuration succeeded
+ */
+gboolean ww_display_set_window_observation_capabilities(WwDisplay* self, guint capabilities);
+void     ww_display_set_window_observation_state(WwDisplay* self, guint64 generation, guint flags);
 
 /**
  * ww_display_disconnect:

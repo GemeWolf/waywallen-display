@@ -34,6 +34,7 @@ qt_add_qml_module(waywallen-display-qml
         QsgPresentationNode.hpp
         QsgPresentationNode.cpp
         WaywallenDisplay.hpp
+        WindowPattern.hpp
         WaywallenDisplay.cpp
         WaywallenDisplayRender.cpp
         PluginInfo.hpp

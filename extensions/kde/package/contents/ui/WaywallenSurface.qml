@@ -11,10 +11,11 @@ Item {
         anchors.fill: parent
 
         autoReconnect: true
-        presentationCapabilities: P.PluginDisplay.PauseBlurCapability
-                                  | P.PluginDisplay.FadeTransitionCapability
-                                  | P.PluginDisplay.WipeTransitionCapability
-                                  | P.PluginDisplay.GrowTransitionCapability
+        windowObservationCapabilities: 15
+        pauseEffectCapabilities: P.PluginDisplay.PauseEffectBlurCapability
+        transitionCapabilities: P.PluginDisplay.TransitionFadeCapability
+                                | P.PluginDisplay.TransitionWipeCapability
+                                | P.PluginDisplay.TransitionGrowCapability
     }
 
     Loader {

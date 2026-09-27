@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -13,23 +12,73 @@ pub mod niri;
 pub mod wayfire;
 pub mod wlr;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Window {
+    pub application_id: String,
+    pub title: String,
+    pub flags: u32,
+}
+
+#[derive(Clone, Default)]
+pub struct WindowExclusions {
+    pub generation: u64,
+    pub application_ids: Vec<String>,
+    pub titles: Vec<String>,
+    pub application_id_patterns: Vec<wildmatch::WildMatch>,
+    pub title_patterns: Vec<wildmatch::WildMatch>,
+}
+
+impl WindowExclusions {
+    pub fn matches(&self, window: &Window) -> bool {
+        (!window.application_id.is_empty()
+            && (self.application_ids.contains(&window.application_id)
+                || self
+                    .application_id_patterns
+                    .iter()
+                    .any(|pattern| pattern.matches(&window.application_id))))
+            || (!window.title.is_empty()
+                && (self.titles.contains(&window.title)
+                    || self
+                        .title_patterns
+                        .iter()
+                        .any(|pattern| pattern.matches(&window.title))))
+    }
+}
+
+#[derive(Default)]
+struct Observation {
+    windows: Option<Vec<Window>>,
+    config: Option<WindowExclusions>,
+}
+
+impl Observation {
+    fn state(&self) -> (Option<u64>, u32) {
+        let flags = self
+            .windows
+            .iter()
+            .flatten()
+            .filter(|window| {
+                !self
+                    .config
+                    .as_ref()
+                    .is_some_and(|config| config.matches(window))
+            })
+            .fold(0, |flags, window| flags | window.flags);
+        (self.config.as_ref().map(|config| config.generation), flags)
+    }
+}
+
 pub struct OutputInfo {
-    display_name: String,
     logical_size: Mutex<Option<(u32, u32)>>,
-    window_flags: AtomicU32,
+    observation: Mutex<Observation>,
 }
 
 impl OutputInfo {
-    pub fn new(display_name: String) -> Self {
+    pub fn new() -> Self {
         Self {
-            display_name,
             logical_size: Mutex::new(None),
-            window_flags: AtomicU32::new(0),
+            observation: Mutex::new(Observation::default()),
         }
-    }
-
-    pub fn display_name(&self) -> &str {
-        &self.display_name
     }
 
     pub fn logical_size(&self) -> Option<(u32, u32)> {
@@ -41,11 +90,27 @@ impl OutputInfo {
     }
 
     pub fn window_flags(&self) -> u32 {
-        self.window_flags.load(Ordering::SeqCst)
+        self.window_state().1
     }
 
-    pub fn replace_window_flags(&self, flags: u32) -> bool {
-        self.window_flags.swap(flags, Ordering::SeqCst) != flags
+    pub fn window_state(&self) -> (Option<u64>, u32) {
+        self.observation.lock().unwrap().state()
+    }
+
+    #[cfg(test)]
+    pub fn observation_available(&self) -> bool {
+        self.observation.lock().unwrap().windows.is_some()
+    }
+
+    pub fn replace_windows(&self, windows: Vec<Window>) -> bool {
+        let mut observation = self.observation.lock().unwrap();
+        let before = observation.state();
+        observation.windows = Some(windows);
+        before != observation.state()
+    }
+
+    pub fn configure(&self, config: Option<WindowExclusions>) {
+        self.observation.lock().unwrap().config = config;
     }
 }
 
@@ -61,7 +126,7 @@ pub fn new_registry() -> BindingRegistry {
 /// which workspace is visible, and every window on a hidden one has to stay out
 /// of the count. [`cosmic`] reads the same knowledge off COSMIC's own
 /// protocols, and [`wlr`] is the fallback for everything else.
-pub fn spawn_all(registry: BindingRegistry, commands: CommandSender) {
+pub fn spawn_all(registry: BindingRegistry, commands: CommandSender) -> bool {
     if hyprland::detect_socket().is_some() {
         hyprland::spawn(registry, commands)
     } else if niri::detect_socket().is_some() {
@@ -69,7 +134,8 @@ pub fn spawn_all(registry: BindingRegistry, commands: CommandSender) {
     } else if wayfire::detect_socket().is_some() {
         wayfire::spawn(registry, commands)
     } else if cosmic::detect() {
-        cosmic::spawn(commands)
+        cosmic::spawn(commands);
+        true
     } else {
         wlr::spawn(commands)
     }
@@ -77,7 +143,10 @@ pub fn spawn_all(registry: BindingRegistry, commands: CommandSender) {
 
 #[derive(Debug)]
 pub enum Command {
-    WindowState { display_name: String, flags: u32 },
+    WindowState {
+        display_name: String,
+        windows: Vec<Window>,
+    },
 }
 
 #[derive(Clone)]
@@ -151,7 +220,84 @@ pub fn command_channel() -> io::Result<(CommandSender, CommandReceiver)> {
 
 #[cfg(test)]
 mod tests {
-    use super::command_channel;
+    use super::*;
+
+    #[test]
+    fn config_recomputes_existing_windows_without_clearing_other_contributors() {
+        let output = OutputInfo::new();
+        assert!(!output.observation_available());
+        output.replace_windows(vec![
+            Window {
+                application_id: "Cat".into(),
+                title: "猫".into(),
+                flags: 5,
+            },
+            Window {
+                application_id: "editor".into(),
+                title: "code".into(),
+                flags: 3,
+            },
+        ]);
+        assert_eq!(output.window_state(), (None, 7));
+        output.configure(Some(WindowExclusions {
+            generation: 1,
+            application_ids: vec!["Cat".into()],
+            titles: vec![],
+            ..Default::default()
+        }));
+        assert_eq!(output.window_state(), (Some(1), 3));
+        output.configure(Some(WindowExclusions {
+            generation: 2,
+            application_ids: vec!["cat".into()],
+            titles: vec!["code".into()],
+            ..Default::default()
+        }));
+        assert_eq!(output.window_state(), (Some(2), 5));
+        output.configure(None);
+        assert_eq!(output.window_state(), (None, 7));
+    }
+
+    #[test]
+    fn empty_identity_never_matches() {
+        let rules = WindowExclusions {
+            titles: vec![String::new()],
+            application_ids: vec![String::new()],
+            application_id_patterns: vec![wildmatch::WildMatch::new("*")],
+            title_patterns: vec![wildmatch::WildMatch::new("*")],
+            ..Default::default()
+        };
+        assert!(!rules.matches(&Window::default()));
+    }
+
+    #[test]
+    fn wildcard_vectors() {
+        let tests: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../tests/window_patterns.json")).unwrap();
+        for test in tests.as_array().unwrap() {
+            let pattern = test["pattern"].as_str().unwrap();
+            let value = test["value"].as_str().unwrap();
+            assert_eq!(
+                wildmatch::WildMatch::new(pattern).matches(value),
+                test["matched"].as_bool().unwrap(),
+                "pattern={pattern:?}, value={value:?}"
+            );
+        }
+        let window = Window {
+            application_id: "cat".into(),
+            title: "clock 12:34".into(),
+            flags: 1,
+        };
+        let exact = WindowExclusions {
+            titles: vec!["clock*".into()],
+            ..Default::default()
+        };
+        assert!(!exact.matches(&window));
+        let wildcard = WindowExclusions {
+            title_patterns: vec![wildmatch::WildMatch::new("clock*")],
+            ..Default::default()
+        };
+        assert!(wildcard.matches(&window));
+    }
 
     #[test]
     fn closed_sender_removes_the_wake_fd() {

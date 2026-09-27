@@ -166,6 +166,11 @@ export default class WaywallenExtension extends Extension {
         proc.setControlHandler(frame => {
             if (this._currentProc !== proc || !this._override)
                 return;
+            if (frame.type === 'window-observation-config') {
+                this._winState?.applyConfig(frame.geometry, frame.config);
+                return;
+            }
+            if (frame.type === 'reset') this._winState?.resetConfig(frame.geometry);
             const applied = this._override.applyControlFrame(frame);
             if (applied && frame.type === 'reset')
                 this._override.setRendererAvailable(false);

@@ -177,8 +177,7 @@ pub(super) fn make_output_binding(
         _ => format!("{name_prefix}-{output_name}"),
     };
     let instance_id = layer_instance_id(entry, output_name);
-    let watcher = existing_watcher
-        .unwrap_or_else(|| Arc::new(watcher::OutputInfo::new(display_name.clone())));
+    let watcher = existing_watcher.unwrap_or_else(|| Arc::new(watcher::OutputInfo::new()));
     log::info!(
         "output {output_name}: identity '{}' -> instance_id={instance_id}",
         output_identity_key(entry, output_name)
@@ -539,8 +538,8 @@ impl Dispatch<ZwlrLayerSurfaceV1, u32> for App {
                         None,
                     ));
                     if let Some(binding) = entry.binding.as_ref() {
-                        if let Some(flags) = state.window_states.get(binding.display_name()) {
-                            binding.watcher.replace_window_flags(*flags);
+                        if let Some(windows) = state.window_states.get(binding.display_name()) {
+                            binding.watcher.replace_windows(windows.clone());
                         }
                     }
                 }

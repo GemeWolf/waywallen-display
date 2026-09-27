@@ -8,6 +8,7 @@ import Meta from 'gi://Meta';
 import GLib from 'gi://GLib';
 
 import * as Wallpaper from './wallpaper.js';
+import {WindowExclusions} from './windowExclusions.js';
 
 const APPLICATION_ID = Wallpaper.APPLICATION_ID;
 
@@ -26,6 +27,8 @@ export class WindowStateMonitor {
         this._lastFlags = new Map();  // monitor index -> last sent flags
         this._debounceId = 0;
         this._initId = 0;
+        this._configs = new Map();
+        this._windowSignals = new Map();
     }
 
     setLauncher(launcher) {
@@ -33,6 +36,7 @@ export class WindowStateMonitor {
         // New renderer: force a resend of every monitor's state once its
         // display connection is up (set_window_state is dropped pre-connect).
         this._lastFlags.clear();
+        this._configs.clear();
         if (this._initId)
             GLib.source_remove(this._initId);
         this._initId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
@@ -58,6 +62,11 @@ export class WindowStateMonitor {
     }
 
     disable() {
+        for (const [window, signals] of this._windowSignals) {
+            for (const id of signals) { try { window.disconnect(id); } catch (_e) {} }
+        }
+        this._windowSignals.clear();
+        this._configs.clear();
         for (const [obj, id] of this._sigs) {
             try { obj.disconnect(id); } catch (_e) {}
         }
@@ -85,6 +94,17 @@ export class WindowStateMonitor {
             });
     }
 
+    applyConfig(geometry, config) {
+        this._configs.set(`${geometry.x},${geometry.y}`, new WindowExclusions(config));
+        this._lastFlags.clear();
+        this._recompute();
+    }
+
+    resetConfig(geometry) {
+        this._configs.delete(`${geometry.x},${geometry.y}`);
+        this._lastFlags.clear();
+    }
+
     _recompute() {
         if (!this._launcher?.running)
             return;
@@ -92,8 +112,19 @@ export class WindowStateMonitor {
         if (!ws)
             return;
 
+        const windows = ws.list_windows();
+        for (const [window, signals] of this._windowSignals) {
+            if (windows.includes(window)) continue;
+            for (const id of signals) { try { window.disconnect(id); } catch (_e) {} }
+            this._windowSignals.delete(window);
+        }
         const acc = new Map();  // monitor index -> flags
-        for (const w of ws.list_windows()) {
+        for (const w of windows) {
+            if (!this._windowSignals.has(w)) {
+                const signals = ['notify::title', 'notify::wm-class', 'notify::gtk-application-id']
+                    .map(signal => w.connect(signal, () => this._queue()));
+                this._windowSignals.set(w, signals);
+            }
             if (w.skip_taskbar || w.minimized)
                 continue;
             if (w.title?.includes(APPLICATION_ID))
@@ -103,6 +134,11 @@ export class WindowStateMonitor {
             const m = w.get_monitor();
             if (m < 0)
                 continue;
+            const geometry = global.display.get_monitor_geometry(m);
+            const config = this._configs.get(`${geometry.x},${geometry.y}`);
+            const applicationId = w.get_gtk_application_id?.() || w.get_wm_class?.() || '';
+            const title = w.get_title?.() || '';
+            if (config?.matches(applicationId, title)) continue;
             let fl = (acc.get(m) ?? 0) | WIN_NON_MINIMIZED;
             if (w.has_focus())
                 fl |= WIN_ACTIVE;
@@ -120,7 +156,9 @@ export class WindowStateMonitor {
                 continue;
             this._lastFlags.set(m, fl);
             const g = global.display.get_monitor_geometry(m);
-            this._launcher.writeStdin(`W ${g.x} ${g.y} ${fl}\n`);
+            const config = this._configs.get(`${g.x},${g.y}`);
+            const generation = config ? ` ${config.generation}` : '';
+            this._launcher.writeStdin(`W ${g.x} ${g.y} ${fl}${generation}\n`);
         }
     }
 

@@ -3,11 +3,10 @@ use std::io::{BufRead, BufReader};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crate::watcher::{BindingRegistry, Command as WatcherCommand, CommandSender, OutputInfo};
+use crate::watcher::{BindingRegistry, Command as WatcherCommand, CommandSender, Window};
 use waywallen_display::{
     WAYWALLEN_WIN_HAS_ACTIVE, WAYWALLEN_WIN_HAS_FULLSCREEN, WAYWALLEN_WIN_HAS_MAXIMIZED,
     WAYWALLEN_WIN_HAS_NON_MINIMIZED,
@@ -27,17 +26,35 @@ pub fn detect_socket() -> Option<PathBuf> {
     }
 }
 
-pub fn spawn(registry: BindingRegistry, commands: CommandSender) {
+pub fn spawn(registry: BindingRegistry, commands: CommandSender) -> bool {
     let Some(sock) = detect_socket() else {
-        return;
+        return false;
     };
     log::info!("hyprland_watcher: enabled (socket={})", sock.display());
-    thread::spawn(move || run_loop(sock, registry, commands));
+    let stream = match UnixStream::connect(&sock) {
+        Ok(stream) => stream,
+        Err(error) => {
+            log::warn!("hyprland_watcher: connect: {error}");
+            return false;
+        }
+    };
+    thread::spawn(move || run_loop(sock, stream, registry, commands));
+    true
 }
 
-fn run_loop(socket_path: PathBuf, registry: BindingRegistry, commands: CommandSender) {
+fn run_loop(
+    socket_path: PathBuf,
+    initial_stream: UnixStream,
+    registry: BindingRegistry,
+    commands: CommandSender,
+) {
+    let mut initial_stream = Some(initial_stream);
     loop {
-        match UnixStream::connect(&socket_path) {
+        match initial_stream
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| UnixStream::connect(&socket_path))
+        {
             Ok(stream) => {
                 push_state(&registry, &commands);
                 let reader = BufReader::new(stream);
@@ -57,7 +74,7 @@ fn run_loop(socket_path: PathBuf, registry: BindingRegistry, commands: CommandSe
     }
 }
 
-fn push_state(registry: &BindingRegistry, commands: &CommandSender) {
+fn push_state(_registry: &BindingRegistry, commands: &CommandSender) {
     let snapshot = match hyprctl_snapshot() {
         Ok(v) => v,
         Err(e) => {
@@ -65,22 +82,21 @@ fn push_state(registry: &BindingRegistry, commands: &CommandSender) {
             return;
         }
     };
-    let by_output = aggregate_flags(&snapshot);
-    let bindings: Vec<Arc<OutputInfo>> = registry.lock().unwrap().values().cloned().collect();
-    for binding in bindings {
-        let flags = by_output.get(binding.display_name()).copied().unwrap_or(0);
-        if !binding.replace_window_flags(flags) {
-            continue;
-        }
+    let by_output = windows_by_output(&snapshot);
+    for monitor in &snapshot.monitors {
         commands.send(WatcherCommand::WindowState {
-            display_name: binding.display_name().to_string(),
-            flags,
+            display_name: monitor.name.clone(),
+            windows: by_output.get(&monitor.name).cloned().unwrap_or_default(),
         });
     }
 }
 
 #[derive(serde::Deserialize)]
 struct Client {
+    #[serde(default)]
+    class: String,
+    #[serde(default)]
+    title: String,
     address: String,
     monitor: i64,
     workspace: Workspace,
@@ -139,7 +155,7 @@ fn run_hyprctl_json<T: serde::de::DeserializeOwned>(args: &[&str]) -> anyhow::Re
     Ok(serde_json::from_slice(&out.stdout)?)
 }
 
-fn aggregate_flags(snap: &Snapshot) -> HashMap<String, u32> {
+fn windows_by_output(snap: &Snapshot) -> HashMap<String, Vec<Window>> {
     let mon_name: HashMap<i64, String> = snap
         .monitors
         .iter()
@@ -151,7 +167,7 @@ fn aggregate_flags(snap: &Snapshot) -> HashMap<String, u32> {
         .map(|m| (m.id, m.active_workspace.id))
         .collect();
     let active = snap.active_addr.as_deref();
-    let mut out: HashMap<String, u32> = HashMap::new();
+    let mut out: HashMap<String, Vec<Window>> = HashMap::new();
     for c in &snap.clients {
         if !c.mapped {
             continue;
@@ -162,16 +178,20 @@ fn aggregate_flags(snap: &Snapshot) -> HashMap<String, u32> {
         if active_ws.get(&c.monitor) != Some(&c.workspace.id) {
             continue;
         }
-        let entry = out.entry(name.clone()).or_insert(0);
-        *entry |= WAYWALLEN_WIN_HAS_NON_MINIMIZED;
+        let mut flags = WAYWALLEN_WIN_HAS_NON_MINIMIZED;
         if Some(c.address.as_str()) == active {
-            *entry |= WAYWALLEN_WIN_HAS_ACTIVE;
+            flags |= WAYWALLEN_WIN_HAS_ACTIVE;
         }
         match c.fullscreen {
-            1 => *entry |= WAYWALLEN_WIN_HAS_MAXIMIZED,
-            2 => *entry |= WAYWALLEN_WIN_HAS_FULLSCREEN,
+            1 => flags |= WAYWALLEN_WIN_HAS_MAXIMIZED,
+            2 => flags |= WAYWALLEN_WIN_HAS_FULLSCREEN,
             _ => {}
         }
+        out.entry(name.clone()).or_default().push(Window {
+            application_id: c.class.clone(),
+            title: c.title.clone(),
+            flags,
+        });
     }
     out
 }

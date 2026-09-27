@@ -9,6 +9,12 @@ Item {
     // semantics — only windows whose centroid lies inside this rect
     // are counted.
     property var screenGeometry
+    property var observer: null
+
+    Connections {
+        target: wm.observer
+        function onWindowObservationChanged() { wm.recompute(); }
+    }
 
     readonly property int flags: _flags
     property int _flags: 0
@@ -43,6 +49,7 @@ Item {
     Component.onCompleted: recompute()
     onScreenGeometryChanged: recompute()
     onShowingDesktopChanged: recompute()
+    onObserverChanged: recompute()
 
     function _role(idx, name) {
         return tasksModel.data(idx, TaskManager.AbstractTasksModel[name]);
@@ -61,6 +68,9 @@ Item {
             // are taken as "on every activity" and counted.
             const acts = _role(idx, "Activities");
             if (acts && acts.length && acts.indexOf(act) === -1) continue;
+            const applicationId = _role(idx, "AppId") || "";
+            const title = tasksModel.data(idx, 0) || "";
+            if (observer?.excludesWindow(applicationId, title)) continue;
             const isMin  = _role(idx, "IsMinimized")  === true;
             const isAct  = _role(idx, "IsActive")     === true;
             const isFull = _role(idx, "IsFullScreen") === true;

@@ -176,6 +176,10 @@ typedef struct waywallen_display_metrics {
     uint32_t refresh_mhz;
 } waywallen_display_metrics_t;
 
+typedef struct waywallen_pause_effect_capabilities {
+    uint32_t flags;
+} waywallen_pause_effect_capabilities_t;
+
 typedef struct waywallen_pause_effect_config {
     waywallen_pause_effect_kind_t kind;
     waywallen_blur_effect_config_t blur;
@@ -214,6 +218,24 @@ typedef struct waywallen_presentation_snapshot {
     waywallen_presentation_state_t state;
 } waywallen_presentation_snapshot_t;
 
+typedef struct waywallen_transition_capabilities {
+    uint32_t flags;
+} waywallen_transition_capabilities_t;
+
+typedef struct waywallen_window_observation_capabilities {
+    uint32_t flags;
+} waywallen_window_observation_capabilities_t;
+
+typedef struct waywallen_window_observation_config {
+    uint64_t generation;
+    ww_array_string_t excluded_application_ids;
+    ww_array_string_t excluded_titles;
+    bool has_excluded_application_id_patterns;
+    ww_array_string_t excluded_application_id_patterns;
+    bool has_excluded_title_patterns;
+    ww_array_string_t excluded_title_patterns;
+} waywallen_window_observation_config_t;
+
 #endif /* WAYWALLEN_PROTOCOL_NAMED_TYPES_DEFINED */
 
 /* --- Named value lifecycle --- */
@@ -223,6 +245,7 @@ void waywallen_rgba_color_free(waywallen_rgba_color_t *value);
 void waywallen_composition_config_free(waywallen_composition_config_t *value);
 void waywallen_consumer_capabilities_free(waywallen_consumer_capabilities_t *value);
 void waywallen_display_metrics_free(waywallen_display_metrics_t *value);
+void waywallen_pause_effect_capabilities_free(waywallen_pause_effect_capabilities_t *value);
 void waywallen_pause_effect_config_free(waywallen_pause_effect_config_t *value);
 void waywallen_pause_effect_state_free(waywallen_pause_effect_state_t *value);
 void waywallen_presentation_capabilities_free(waywallen_presentation_capabilities_t *value);
@@ -230,6 +253,9 @@ void waywallen_transition_config_free(waywallen_transition_config_t *value);
 void waywallen_presentation_config_free(waywallen_presentation_config_t *value);
 void waywallen_presentation_state_free(waywallen_presentation_state_t *value);
 void waywallen_presentation_snapshot_free(waywallen_presentation_snapshot_t *value);
+void waywallen_transition_capabilities_free(waywallen_transition_capabilities_t *value);
+void waywallen_window_observation_capabilities_free(waywallen_window_observation_capabilities_t *value);
+void waywallen_window_observation_config_free(waywallen_window_observation_config_t *value);
 
 /* --- Opcodes --- */
 
@@ -244,6 +270,8 @@ typedef enum ww_request_op {
     WW_REQ_ACK_UNBIND = 11,
     WW_REQ_SET_WINDOW_STATE = 12,
     WW_REQ_FRAME_RELEASE_ARMED = 13,
+    WW_REQ_CLIENT_CAPABILITIES = 14,
+    WW_REQ_SET_WINDOW_OBSERVATION_STATE = 15,
 } ww_request_op_t;
 
 typedef enum ww_event_op {
@@ -256,6 +284,7 @@ typedef enum ww_event_op {
     WW_EVT_ERROR = 7,
     WW_EVT_SET_PRESENTATION_SNAPSHOT = 8,
     WW_EVT_SET_PRESENTATION_STATE = 9,
+    WW_EVT_SET_WINDOW_OBSERVATION_CONFIG = 10,
 } ww_event_op_t;
 
 typedef struct ww_req_hello_t {
@@ -322,6 +351,20 @@ typedef struct ww_req_frame_release_armed_t {
     uint64_t seq;
 } ww_req_frame_release_armed_t;
 
+typedef struct ww_req_client_capabilities_t {
+    bool has_window_observation;
+    waywallen_window_observation_capabilities_t window_observation;
+    bool has_pause_effect;
+    waywallen_pause_effect_capabilities_t pause_effect;
+    bool has_transition;
+    waywallen_transition_capabilities_t transition;
+} ww_req_client_capabilities_t;
+
+typedef struct ww_req_set_window_observation_state_t {
+    uint64_t config_generation;
+    uint32_t flags;
+} ww_req_set_window_observation_state_t;
+
 typedef struct ww_evt_welcome_t {
     char *server_version;
 } ww_evt_welcome_t;
@@ -373,6 +416,10 @@ typedef struct ww_evt_set_presentation_snapshot_t {
 typedef struct ww_evt_set_presentation_state_t {
     waywallen_presentation_state_t state;
 } ww_evt_set_presentation_state_t;
+
+typedef struct ww_evt_set_window_observation_config_t {
+    waywallen_window_observation_config_t config;
+} ww_evt_set_window_observation_config_t;
 
 /* --- Per-message functions ---
  * encode:        append wire body to `out` (header is the caller's job)
@@ -431,6 +478,16 @@ int  ww_req_frame_release_armed_decode(const uint8_t *buf, size_t len, ww_req_fr
 void ww_req_frame_release_armed_free(ww_req_frame_release_armed_t *m);
 uint32_t ww_req_frame_release_armed_expected_fds(const ww_req_frame_release_armed_t *m);
 
+int  ww_req_client_capabilities_encode(const ww_req_client_capabilities_t *m, ww_buf_t *out);
+int  ww_req_client_capabilities_decode(const uint8_t *buf, size_t len, ww_req_client_capabilities_t *out);
+void ww_req_client_capabilities_free(ww_req_client_capabilities_t *m);
+uint32_t ww_req_client_capabilities_expected_fds(const ww_req_client_capabilities_t *m);
+
+int  ww_req_set_window_observation_state_encode(const ww_req_set_window_observation_state_t *m, ww_buf_t *out);
+int  ww_req_set_window_observation_state_decode(const uint8_t *buf, size_t len, ww_req_set_window_observation_state_t *out);
+void ww_req_set_window_observation_state_free(ww_req_set_window_observation_state_t *m);
+uint32_t ww_req_set_window_observation_state_expected_fds(const ww_req_set_window_observation_state_t *m);
+
 int  ww_evt_welcome_encode(const ww_evt_welcome_t *m, ww_buf_t *out);
 int  ww_evt_welcome_decode(const uint8_t *buf, size_t len, ww_evt_welcome_t *out);
 void ww_evt_welcome_free(ww_evt_welcome_t *m);
@@ -475,6 +532,11 @@ int  ww_evt_set_presentation_state_encode(const ww_evt_set_presentation_state_t 
 int  ww_evt_set_presentation_state_decode(const uint8_t *buf, size_t len, ww_evt_set_presentation_state_t *out);
 void ww_evt_set_presentation_state_free(ww_evt_set_presentation_state_t *m);
 uint32_t ww_evt_set_presentation_state_expected_fds(const ww_evt_set_presentation_state_t *m);
+
+int  ww_evt_set_window_observation_config_encode(const ww_evt_set_window_observation_config_t *m, ww_buf_t *out);
+int  ww_evt_set_window_observation_config_decode(const uint8_t *buf, size_t len, ww_evt_set_window_observation_config_t *out);
+void ww_evt_set_window_observation_config_free(ww_evt_set_window_observation_config_t *m);
+uint32_t ww_evt_set_window_observation_config_expected_fds(const ww_evt_set_window_observation_config_t *m);
 
 /* --- Output buffer helpers --- */
 void ww_buf_init(ww_buf_t *b);

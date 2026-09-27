@@ -18,7 +18,7 @@
 //! That is why [`crate::watcher::spawn_all`] hands the compositor to its own
 //! watcher whenever there is one and only falls back to this.
 
-use crate::watcher::{Command, CommandSender};
+use crate::watcher::{Command, CommandSender, Window};
 use std::collections::{HashMap, HashSet};
 use std::thread;
 use wayland_client::backend::ObjectId;
@@ -45,19 +45,19 @@ const MANAGER_VERSION: u32 = 3;
 /// by, and it needs version 4.
 const OUTPUT_VERSION: u32 = 4;
 
-pub fn spawn(commands: CommandSender) {
+pub fn spawn(commands: CommandSender) -> bool {
     let conn = match Connection::connect_to_env() {
         Ok(conn) => conn,
         Err(error) => {
             log::error!("wlr_watcher: connect to compositor: {error}");
-            return;
+            return false;
         }
     };
     let (globals, queue) = match registry_queue_init::<Watcher>(&conn) {
         Ok(pair) => pair,
         Err(error) => {
             log::error!("wlr_watcher: registry init: {error}");
-            return;
+            return false;
         }
     };
     let qh = queue.handle();
@@ -85,13 +85,14 @@ pub fn spawn(commands: CommandSender) {
     }
     let Some(manager) = manager else {
         log::debug!("wlr_watcher: compositor does not expose {MANAGER_INTERFACE}");
-        return;
+        return false;
     };
     log::info!(
         "wlr_watcher: enabled ({MANAGER_INTERFACE} v{})",
         manager.version()
     );
     thread::spawn(move || run_loop(queue, watcher, manager));
+    true
 }
 
 fn run_loop(
@@ -131,6 +132,8 @@ struct Output {
 
 #[derive(Default)]
 struct Toplevel {
+    identity: Window,
+    pending_identity: Window,
     outputs: HashSet<ObjectId>,
     state: WindowState,
     pending_outputs: HashSet<ObjectId>,
@@ -143,11 +146,15 @@ impl Toplevel {
     /// pair for the same output on every fullscreen toggle, and labwc sends two
     /// `state` events in one batch when a window is minimized.
     fn commit(&mut self) -> bool {
-        if self.outputs == self.pending_outputs && self.state == self.pending_state {
+        if self.outputs == self.pending_outputs
+            && self.state == self.pending_state
+            && self.identity == self.pending_identity
+        {
             return false;
         }
         self.outputs.clone_from(&self.pending_outputs);
         self.state = self.pending_state;
+        self.identity.clone_from(&self.pending_identity);
         true
     }
 }
@@ -237,8 +244,8 @@ impl Watcher {
         self.dirty = true;
     }
 
-    fn aggregate_flags(&self) -> HashMap<&str, u32> {
-        let mut by_output: HashMap<&str, u32> = HashMap::new();
+    fn windows_by_output(&self) -> HashMap<&str, Vec<Window>> {
+        let mut by_output: HashMap<&str, Vec<Window>> = HashMap::new();
         for toplevel in self.toplevels.values() {
             let flags = toplevel.state.to_flags();
             if flags == 0 {
@@ -252,24 +259,25 @@ impl Watcher {
                 else {
                     continue;
                 };
-                *by_output.entry(display_name).or_insert(0) |= flags;
+                by_output.entry(display_name).or_default().push(Window {
+                    flags,
+                    ..toplevel.identity.clone()
+                });
             }
         }
         by_output
     }
 
     fn push_state(&self) {
-        let by_output = self.aggregate_flags();
+        let by_output = self.windows_by_output();
         for display_name in self
             .outputs
             .values()
             .filter_map(|output| output.display_name.as_deref())
         {
-            let flags = by_output.get(display_name).copied().unwrap_or(0);
-            log::debug!("wlr_watcher: {display_name} flags: {flags}");
             self.commands.send(Command::WindowState {
                 display_name: display_name.to_string(),
-                flags,
+                windows: by_output.get(display_name).cloned().unwrap_or_default(),
             });
         }
     }
@@ -364,6 +372,14 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Watcher {
             return;
         };
         let changed = match event {
+            zwlr_foreign_toplevel_handle_v1::Event::Title { title } => {
+                toplevel.pending_identity.title = title;
+                false
+            }
+            zwlr_foreign_toplevel_handle_v1::Event::AppId { app_id } => {
+                toplevel.pending_identity.application_id = app_id;
+                false
+            }
             zwlr_foreign_toplevel_handle_v1::Event::OutputEnter { output } => {
                 toplevel.pending_outputs.insert(output.id());
                 false
@@ -396,6 +412,17 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Watcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_is_committed_at_done() {
+        let mut toplevel = Toplevel::default();
+        toplevel.pending_identity.title = "new title".into();
+        toplevel.pending_identity.application_id = "cat".into();
+        assert!(toplevel.identity.title.is_empty());
+        assert!(toplevel.commit());
+        assert_eq!(toplevel.identity.title, "new title");
+        assert!(!toplevel.commit());
+    }
 
     fn payload(states: &[State]) -> Vec<u8> {
         states

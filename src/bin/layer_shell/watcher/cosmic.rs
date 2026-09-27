@@ -210,6 +210,8 @@ struct Output {
 
 #[derive(Default)]
 struct Toplevel {
+    identity: crate::watcher::Window,
+    pending_identity: crate::watcher::Window,
     state: WindowState,
     outputs: HashSet<ObjectId>,
     workspaces: HashSet<ObjectId>,
@@ -346,8 +348,8 @@ impl Watcher {
                 .any(|id| self.workspaces.get(id).is_some_and(|ws| ws.active))
     }
 
-    fn aggregate_flags(&self) -> HashMap<String, u32> {
-        let mut by_output: HashMap<String, u32> = HashMap::new();
+    fn windows_by_output(&self) -> HashMap<String, Vec<crate::watcher::Window>> {
+        let mut by_output: HashMap<String, Vec<crate::watcher::Window>> = HashMap::new();
         for toplevel in self.toplevels.values() {
             let flags = toplevel.state.to_flags();
             if flags == 0 || !self.is_visible(toplevel) {
@@ -361,26 +363,43 @@ impl Watcher {
                 else {
                     continue;
                 };
-                *by_output.entry(display_name).or_insert(0) |= flags;
+                by_output
+                    .entry(display_name)
+                    .or_default()
+                    .push(crate::watcher::Window {
+                        flags,
+                        ..toplevel.identity.clone()
+                    });
             }
         }
         by_output
     }
 
     fn push_state(&self) {
-        let by_output = self.aggregate_flags();
+        let by_output = self.windows_by_output();
         for display_name in self
             .outputs
             .values()
             .filter_map(|output| output.display_name.as_deref())
         {
-            let flags = by_output.get(display_name).copied().unwrap_or(0);
-            log::debug!("cosmic_watcher: {display_name} flags: {flags}");
             self.commands.send(Command::WindowState {
                 display_name: display_name.to_string(),
-                flags,
+                windows: by_output.get(display_name).cloned().unwrap_or_default(),
             });
         }
+    }
+
+    #[cfg(test)]
+    fn aggregate_flags(&self) -> HashMap<String, u32> {
+        self.windows_by_output()
+            .into_iter()
+            .map(|(name, windows)| {
+                (
+                    name,
+                    windows.iter().fold(0, |flags, window| flags | window.flags),
+                )
+            })
+            .collect()
     }
 }
 
@@ -470,7 +489,21 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for Watcher {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // title / app_id / identifier / done carry nothing we need.
+        if let Some(toplevel) = state.toplevels.get_mut(&handle.id()) {
+            match &event {
+                ext_foreign_toplevel_handle_v1::Event::Title { title } => {
+                    toplevel.pending_identity.title.clone_from(title)
+                }
+                ext_foreign_toplevel_handle_v1::Event::AppId { app_id } => {
+                    toplevel.pending_identity.application_id.clone_from(app_id)
+                }
+                ext_foreign_toplevel_handle_v1::Event::Done => {
+                    state.dirty |= toplevel.identity != toplevel.pending_identity;
+                    toplevel.identity.clone_from(&toplevel.pending_identity);
+                }
+                _ => {}
+            }
+        }
         let ext_foreign_toplevel_handle_v1::Event::Closed = event else {
             return;
         };
@@ -781,6 +814,7 @@ mod tests {
                 },
                 outputs: [output_id].into(),
                 workspaces: [workspace_id].into(),
+                ..Default::default()
             },
         );
         assert!(w.aggregate_flags().is_empty());
@@ -805,6 +839,7 @@ mod tests {
                 },
                 outputs: [output_id].into(),
                 workspaces: [workspace_id].into(),
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -834,6 +869,7 @@ mod tests {
                 },
                 outputs: [output_id].into(),
                 workspaces: [workspace_id].into(),
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -856,6 +892,7 @@ mod tests {
                 },
                 outputs: [output_id].into(),
                 workspaces: [null_id()].into(),
+                ..Default::default()
             },
         );
         assert_eq!(

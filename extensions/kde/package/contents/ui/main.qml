@@ -95,6 +95,7 @@ WallpaperItem {
             d.displayHeight = Qt.binding(() => Math.round(root.height * d.effectiveDevicePixelRatio));
             d.mouseForwardEnabled = Qt.binding(() => root.configuration.MouseForward);
             d.windowStateFlags = Qt.binding(() => windowModel.flags);
+            windowModel.observer = d;
             d.contentRevisionChanged.connect(root.scheduleAccentColorRefresh);
         }
     }

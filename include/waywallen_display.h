@@ -59,7 +59,13 @@ extern "C" {
  */
 #define WAYWALLEN_DISPLAY_PROTOCOL_VERSION 9
 
-/* Presentation capabilities declared before connecting. */
+/* Independent capability bitmaps declared before connecting. */
+#define WAYWALLEN_PAUSE_EFFECT_CAP_BLUR (1u << 0)
+#define WAYWALLEN_TRANSITION_CAP_FADE   (1u << 0)
+#define WAYWALLEN_TRANSITION_CAP_WIPE   (1u << 1)
+#define WAYWALLEN_TRANSITION_CAP_GROW   (1u << 2)
+
+/* Deprecated: use WAYWALLEN_PAUSE_EFFECT_CAP_* / WAYWALLEN_TRANSITION_CAP_*. */
 #define WAYWALLEN_PRESENTATION_CAP_PAUSE_BLUR      (1u << 0)
 #define WAYWALLEN_PRESENTATION_CAP_FADE_TRANSITION (1u << 1)
 #define WAYWALLEN_PRESENTATION_CAP_WIPE_TRANSITION (1u << 2)
@@ -457,6 +463,11 @@ int waywallen_display_set_drm_render_node(waywallen_display_t* d, uint32_t major
 /* Declare final-presentation features implemented by this host. Must
  * be called before begin_connect/connect; capability changes require a
  * reconnect. Generic consumers should leave this at zero. */
+int waywallen_display_set_pause_effect_caps(waywallen_display_t* d, uint32_t flags);
+int waywallen_display_set_transition_caps(waywallen_display_t* d, uint32_t flags);
+
+/* Deprecated: replaces both capability groups using the legacy bit layout.
+ * Use the independent setters above for new clients. */
 int waywallen_display_set_presentation_caps(waywallen_display_t* d, uint32_t flags);
 
 /* -------------------------------------------------------------------------
@@ -534,9 +545,9 @@ int waywallen_display_set_metrics(waywallen_display_t*               d,
 
 /*
  * Report which kinds of windows currently cover this display. The
- * daemon translates (flags, per-display AutopauseMode) into renderer
- * Pause/Play. Fire-and-forget — consumers MUST NOT debounce or
- * filter; the daemon owns all policy.
+ * daemon owns Auto Replay actions and timing. Consumers must only apply
+ * daemon-provided window observation rules, never private policy filters.
+ * After the first observation config, use the generation-bearing API below.
  *
  * Latest-value state: an unsent prior value is replaced. Calls made
  * before connect are cached and included atomically in register_display.
@@ -546,6 +557,24 @@ int waywallen_display_set_metrics(waywallen_display_t*               d,
  * ERR_INVAL.
  */
 int waywallen_display_set_window_state(waywallen_display_t* d, uint32_t flags);
+
+#define WAYWALLEN_WINDOW_OBSERVATION_APPLICATION_ID         (1u << 0)
+#define WAYWALLEN_WINDOW_OBSERVATION_TITLE                  (1u << 1)
+#define WAYWALLEN_WINDOW_OBSERVATION_APPLICATION_ID_PATTERN (1u << 2)
+#define WAYWALLEN_WINDOW_OBSERVATION_TITLE_PATTERN          (1u << 3)
+
+/* Configure before connecting. The snapshot belongs to the client and is
+ * valid until replacement or disconnect. The callback must synchronously
+ * copy any values it needs after returning. A NULL callback selects legacy. */
+typedef void (*waywallen_window_observation_callback_t)(
+    void* user_data, const waywallen_window_observation_config_t* config);
+int waywallen_display_set_window_observation_callback(
+    waywallen_display_t* d, uint32_t capabilities, waywallen_window_observation_callback_t callback,
+    void* user_data);
+const waywallen_window_observation_config_t*
+waywallen_display_get_window_observation_config(const waywallen_display_t* d);
+int waywallen_display_set_window_observation_state(waywallen_display_t* d, uint64_t generation,
+                                                   uint32_t flags);
 
 /*
  * Read-side fd for poll(2) integration. Returns -1 if the display is
