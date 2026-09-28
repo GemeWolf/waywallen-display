@@ -81,7 +81,7 @@ impl Dispatch<WlPointer, u32> for App {
                 }
             }
             wl_pointer::Event::Motion {
-                time,
+                time: _,
                 surface_x,
                 surface_y,
             } => {
@@ -95,10 +95,12 @@ impl Dispatch<WlPointer, u32> for App {
                     (out, surface_x, surface_y)
                 };
                 let (x, y) = logical_to_physical(state, output_name, lx, ly);
-                send_pointer_motion(state, output_name, x, y, ms_to_us(time));
+                // wl_pointer.time wraps at 32 bits and has an unspecified epoch.
+                // Stamp CLOCK_MONOTONIC in the display library before enqueueing.
+                send_pointer_motion(state, output_name, x, y, 0);
             }
             wl_pointer::Event::Button {
-                time,
+                time: _,
                 button,
                 state: bstate,
                 ..
@@ -116,9 +118,9 @@ impl Dispatch<WlPointer, u32> for App {
                     wayland_client::WEnum::Value(ButtonState::Released) => 0,
                     _ => return,
                 };
-                send_pointer_button(state, output_name, x, y, button, state_u32, ms_to_us(time));
+                send_pointer_button(state, output_name, x, y, button, state_u32, 0);
             }
-            wl_pointer::Event::Axis { time, axis, value } => {
+            wl_pointer::Event::Axis { axis, value, .. } => {
                 let (output_name, lx, ly, src) = {
                     let Some(ctx) = state.pointers.get(&seat_name) else {
                         return;
@@ -135,7 +137,7 @@ impl Dispatch<WlPointer, u32> for App {
                     wayland_client::WEnum::Value(wl_pointer::Axis::VerticalScroll) => (0.0, delta),
                     _ => return,
                 };
-                send_pointer_axis(state, output_name, x, y, dx, dy, src, ms_to_us(time));
+                send_pointer_axis(state, output_name, x, y, dx, dy, src, 0);
             }
             wl_pointer::Event::AxisSource { axis_source } => {
                 if let Some(ctx) = state.pointers.get_mut(&seat_name) {
@@ -150,10 +152,6 @@ impl Dispatch<WlPointer, u32> for App {
             _ => {}
         }
     }
-}
-
-fn ms_to_us(time_ms: u32) -> u64 {
-    (time_ms as u64).saturating_mul(1000)
 }
 
 fn logical_to_physical(state: &App, output_name: u32, lx: f64, ly: f64) -> (f32, f32) {

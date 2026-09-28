@@ -44,6 +44,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 
 /* ------------------------------------------------------------------ */
@@ -1941,13 +1942,20 @@ static int enc_pointer_axis(const void* m, ww_buf_t* out) {
     return ww_req_pointer_axis_encode((const ww_req_pointer_axis_t*)m, out);
 }
 
+static uint64_t pointer_timestamp(uint64_t timestamp_us) {
+    if (timestamp_us != 0) return timestamp_us;
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (uint64_t)now.tv_sec * UINT64_C(1000000) + (uint64_t)now.tv_nsec / UINT64_C(1000);
+}
+
 int waywallen_display_send_pointer_motion(waywallen_display_t* d, float x, float y,
                                           uint64_t timestamp_us, uint32_t modifiers) {
     if (! d) return WAYWALLEN_ERR_INVAL;
     if (d->conn != WW_CONN_CONNECTED) return WAYWALLEN_ERR_STATE;
     if (! isfinite(x) || ! isfinite(y) || modifiers & ~WAYWALLEN_POINTER_MOD_MASK)
         return WAYWALLEN_ERR_INVAL;
-    ww_req_pointer_motion_t msg = { x, y, timestamp_us, modifiers };
+    ww_req_pointer_motion_t msg = { x, y, pointer_timestamp(timestamp_us), modifiers };
     return outbox_enqueue_request(
         d, WW_OUTBOX_REPLACE_MOTION, WW_REQ_POINTER_MOTION, enc_pointer_motion, &msg);
 }
@@ -1962,7 +1970,7 @@ int waywallen_display_send_pointer_button(waywallen_display_t* d, float x, float
          state != WAYWALLEN_POINTER_BUTTON_STATE_PRESSED)) {
         return WAYWALLEN_ERR_INVAL;
     }
-    ww_req_pointer_button_t msg = { x, y, button, state, timestamp_us, modifiers };
+    ww_req_pointer_button_t msg = { x, y, button, state, pointer_timestamp(timestamp_us), modifiers };
     return outbox_enqueue_request(
         d, WW_OUTBOX_ORDERED, WW_REQ_POINTER_BUTTON, enc_pointer_button, &msg);
 }
@@ -1979,7 +1987,9 @@ int waywallen_display_send_pointer_axis(waywallen_display_t* d, float x, float y
          source != WAYWALLEN_POINTER_AXIS_SOURCE_CONTINUOUS)) {
         return WAYWALLEN_ERR_INVAL;
     }
-    ww_req_pointer_axis_t msg = { x, y, delta_x, delta_y, source, timestamp_us, modifiers };
+    ww_req_pointer_axis_t msg = {
+        x, y, delta_x, delta_y, source, pointer_timestamp(timestamp_us), modifiers
+    };
     return outbox_enqueue_request(
         d, WW_OUTBOX_ORDERED, WW_REQ_POINTER_AXIS, enc_pointer_axis, &msg);
 }

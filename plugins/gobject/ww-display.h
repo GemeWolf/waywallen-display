@@ -256,7 +256,7 @@ void ww_display_close_fd(gint fd);
  * ww_display_send_pointer_motion:
  * @self: a #WwDisplay
  * @x: @y: surface-local pixels (same space as the registered width/height)
- * @timestamp_us: monotonic microseconds, or 0 to let the daemon stamp
+ * @timestamp_us: CLOCK_MONOTONIC microseconds, or 0 to let the library stamp
  * @modifiers: WAYWALLEN_POINTER_MOD_* mask, or 0
  *
  * Best-effort forward of a pointer motion to the daemon, which reverse-

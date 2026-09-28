@@ -651,9 +651,12 @@ int waywallen_display_frame_release_armed(waywallen_display_t* d, uint64_t buffe
  *
  * Coordinates `x` / `y` are surface-local pixels in the same space as
  * `register_display.width`/`height` (post-DPR scaling).
+ * Send motion at (-1, -1) when the pointer leaves this surface. The daemon
+ * forwards a renderer-local leave sample instead of retaining the last point.
  *
- * `timestamp_us` is monotonic microseconds; pass 0 if unavailable —
- * the daemon will stamp on receipt. `modifiers` uses the protocol bits
+ * `timestamp_us` is CLOCK_MONOTONIC microseconds; pass 0 to let the library
+ * stamp before enqueueing. Do not pass wrapping toolkit timestamps.
+ * `modifiers` uses the protocol bits
  * below; adapters own toolkit-specific conversion.
  * ------------------------------------------------------------------------- */
 

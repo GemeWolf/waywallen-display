@@ -127,6 +127,7 @@ class MonitorRenderer {
         this._destroyed = false;
         this._presentation = null;
         this._presentationReady = false;
+        this._pointerMotion = null;
     }
 
     build(app) {
@@ -267,6 +268,7 @@ class MonitorRenderer {
         d.connect('frame-ready',
             (_o, bufferGeneration, idx, seq) =>
                 this._onFrameReady(bufferGeneration, idx, seq));
+        d.connect('composition-config', () => this._onCompositionConfig());
         d.connect('presentation-snapshot',
             (_o, configGeneration, stateGeneration, kind, radius, active,
                 transitionKind, durationMs, angle, originX, originY) =>
@@ -345,6 +347,13 @@ class MonitorRenderer {
         logIndexed(this._index,
             `bound shadow ${w}x${h} fourcc=0x${fourcc.toString(16)} ` +
             `count=${count} backend=${backend}`);
+        this._onCompositionConfig();
+    }
+
+    _onCompositionConfig() {
+        // Pointer state can arrive before a producer is bound. Reapply it on
+        // binding/layout changes even when the physical cursor has not moved.
+        this._resendPointerMotion();
     }
 
     _onFrameReady(_bufferGeneration, _idx, _seq) {
@@ -441,7 +450,22 @@ class MonitorRenderer {
     // x,y are logical monitor-local; daemon wants physical, so scale up.
     sendPointerMotion(x, y, ts) {
         const s = this._scale || 1;
-        this._display?.send_pointer_motion(x * s, y * s, ts, 0);
+        const g = this.monitorGeom();
+        const inside = x >= 0 && y >= 0 && x < g.width && y < g.height;
+        const px = inside ? x * s : -1;
+        const py = inside ? y * s : -1;
+        const previous = this._pointerMotion;
+        this._pointerMotion = [px, py, ts];
+        if (previous?.[0] === px && previous?.[1] === py)
+            return;
+        this._resendPointerMotion();
+    }
+
+    _resendPointerMotion() {
+        if (this._pointerMotion) {
+            const [x, y, ts] = this._pointerMotion;
+            this._display?.send_pointer_motion(x, y, ts, 0);
+        }
     }
 
     sendPointerButton(x, y, code, pressed, ts) {
@@ -517,7 +541,8 @@ const app = new Gtk.Application({
 let renderers = [];
 
 // Input forwarded by the extension over stdin (global compositor coords),
-// routed to the MonitorRenderer whose geometry contains the point:
+// Motion updates every monitor, including a leave sample for other outputs.
+// Buttons, axes and control messages target the monitor containing the point:
 //   M gx gy ts                 motion
 //   B gx gy code pressed ts    button
 //   A gx gy dx dy ts           axis
@@ -529,6 +554,14 @@ function dispatchInput(line) {
     const gy = parseFloat(f[2]);
     if (!Number.isFinite(gx) || !Number.isFinite(gy))
         return;
+    if (f[0] === 'M') {
+        const ts = parseInt(f[3]) || 0;
+        for (const r of renderers) {
+            const g = r.monitorGeom();
+            r.sendPointerMotion(gx - g.x, gy - g.y, ts);
+        }
+        return;
+    }
     const r = renderers.find(rr => {
         const g = rr.monitorGeom();
         return gx >= g.x && gx < g.x + g.width &&
@@ -540,7 +573,6 @@ function dispatchInput(line) {
     const lx = gx - g.x;
     const ly = gy - g.y;
     switch (f[0]) {
-    case 'M': r.sendPointerMotion(lx, ly, parseInt(f[3]) || 0); break;
     case 'B': r.sendPointerButton(lx, ly, parseInt(f[3]) || 0,
                                   f[4] === '1', parseInt(f[5]) || 0); break;
     case 'A': r.sendPointerAxis(lx, ly, parseFloat(f[3]) || 0,

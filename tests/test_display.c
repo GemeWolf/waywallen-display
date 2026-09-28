@@ -94,6 +94,7 @@ struct test_state {
     uint32_t outbox_last_metrics_width;
     uint32_t outbox_last_window_flags;
     int      outbox_saw_critical;
+    uint64_t pointer_timestamps[4];
 
     /* Populated from the atomic register_display request. */
     int                         saw_consumer_caps;
@@ -844,6 +845,37 @@ static int handler_import_failure(int client_fd, struct test_state* ts) {
     if (complete_handshake_capture_caps(client_fd, ts) != 0) return -1;
     if (send_bind_buffers(client_fd, 7, 1) != 0) return -1;
     return receive_import_failure(client_fd, ts);
+}
+
+static int handler_pointer_timestamps(int client_fd, struct test_state* ts) {
+    if (complete_handshake_capture_caps(client_fd, ts) != 0) return -1;
+    for (int i = 0; i < 4; ++i) {
+        uint8_t body[128];
+        uint16_t op;
+        size_t body_len, n_fds;
+        int fds[4];
+        if (ww_codec_recv_request(client_fd, &op, body, sizeof(body), &body_len, fds, 4, &n_fds) != 0)
+            return -1;
+        if (op == WW_REQ_POINTER_MOTION) {
+            ww_req_pointer_motion_t request;
+            if (ww_req_pointer_motion_decode(body, body_len, &request) != WW_OK) return -1;
+            ts->pointer_timestamps[i] = request.timestamp_us;
+            ww_req_pointer_motion_free(&request);
+        } else if (op == WW_REQ_POINTER_BUTTON) {
+            ww_req_pointer_button_t request;
+            if (ww_req_pointer_button_decode(body, body_len, &request) != WW_OK) return -1;
+            ts->pointer_timestamps[i] = request.timestamp_us;
+            ww_req_pointer_button_free(&request);
+        } else if (op == WW_REQ_POINTER_AXIS) {
+            ww_req_pointer_axis_t request;
+            if (ww_req_pointer_axis_decode(body, body_len, &request) != WW_OK) return -1;
+            ts->pointer_timestamps[i] = request.timestamp_us;
+            ww_req_pointer_axis_free(&request);
+        } else {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 static int handler_outbox_semantics(int client_fd, struct test_state* ts) {
@@ -1779,6 +1811,42 @@ static void test_vulkan_requirements_are_complete(void) {
     printf("  ok test_vulkan_requirements_are_complete\n");
 }
 
+static void test_pointer_timestamps_use_monotonic_time_and_preserve_64_bits(void) {
+    struct test_state ts;
+    ts_init(&ts);
+    pthread_t srv = spawn_server(&ts, handler_pointer_timestamps);
+    waywallen_display_t* d = make_client(&ts);
+    assert(begin_test_display(d, ts.sock_path, 640, 480) == WAYWALLEN_OK);
+    assert(drive_handshake(d, 2000) == WAYWALLEN_OK);
+
+    struct timespec before, after;
+    assert(clock_gettime(CLOCK_MONOTONIC, &before) == 0);
+    assert(waywallen_display_send_pointer_motion(d, 10.0f, 20.0f, 0, 0) == WAYWALLEN_OK);
+    assert(waywallen_display_send_pointer_button(
+               d, 10.0f, 20.0f, 272, WAYWALLEN_POINTER_BUTTON_STATE_PRESSED, 0, 0) == WAYWALLEN_OK);
+    assert(waywallen_display_send_pointer_axis(
+               d, 10.0f, 20.0f, 0.0f, 1.0f, WAYWALLEN_POINTER_AXIS_SOURCE_WHEEL, 0, 0) == WAYWALLEN_OK);
+    const uint64_t unwrapped = (UINT64_C(1) << 32) * 1000 + 42;
+    assert(waywallen_display_send_pointer_motion(d, 30.0f, 20.0f, unwrapped, 0) == WAYWALLEN_OK);
+    while (waywallen_display_wants_writable(d)) {
+        assert(waywallen_display_handle_writable(d) == WAYWALLEN_OK);
+    }
+    pthread_join(srv, NULL);
+    assert(clock_gettime(CLOCK_MONOTONIC, &after) == 0);
+    uint64_t lower = (uint64_t)before.tv_sec * 1000000 + (uint64_t)before.tv_nsec / 1000;
+    uint64_t upper = (uint64_t)after.tv_sec * 1000000 + (uint64_t)after.tv_nsec / 1000;
+    for (int i = 0; i < 3; ++i) {
+        assert(ts.pointer_timestamps[i] >= lower);
+        assert(ts.pointer_timestamps[i] <= upper);
+        lower = ts.pointer_timestamps[i];
+    }
+    assert(ts.pointer_timestamps[3] == unwrapped);
+    waywallen_display_close(d);
+    waywallen_display_free(d);
+    ts_teardown(&ts);
+    printf("  ok test_pointer_timestamps_use_monotonic_time_and_preserve_64_bits\n");
+}
+
 static void test_outbox_prioritizes_lifecycle_and_replaces_state(void) {
     struct test_state ts;
     ts_init(&ts);
@@ -1933,6 +2001,7 @@ int main(void) {
     test_unbind_is_valid_for_atomic_binding();
     test_configured_backend_import_failure_is_reported();
     test_vulkan_requirements_are_complete();
+    test_pointer_timestamps_use_monotonic_time_and_preserve_64_bits();
     test_outbox_prioritizes_lifecycle_and_replaces_state();
     test_buffer_generation_restarts_on_new_connection();
     test_frame_release_armed_round_trip();
